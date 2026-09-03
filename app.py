@@ -11,6 +11,20 @@ from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify, render_template
 from PIL import Image, ImageDraw, ImageFont
+
+# Pillow 10 removed the long-deprecated Image.ANTIALIAS constant, but
+# brother_ql 0.9.4 (and some versions of python-barcode's ImageWriter) still
+# reference it during resize, raising:
+#   module 'PIL.Image' has no attribute 'ANTIALIAS'
+# Restore the old names as aliases for the modern Resampling enum so those
+# libraries keep working without downgrading Pillow.
+if not hasattr(Image, "ANTIALIAS"):
+    _resampling = getattr(Image, "Resampling", Image)
+    Image.ANTIALIAS = _resampling.LANCZOS
+    Image.LANCZOS = _resampling.LANCZOS
+    Image.BICUBIC = _resampling.BICUBIC
+    Image.BILINEAR = _resampling.BILINEAR
+    Image.NEAREST = _resampling.NEAREST
 import qrcode
 import barcode
 from barcode.writer import ImageWriter
