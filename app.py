@@ -23,7 +23,9 @@ from brother_ql.conversion import convert
 from brother_ql.backends.helpers import send as ql_send, guess_backend
 
 PRINT_MAX_RETRIES = 5
-PRINT_RETRY_DELAY = 2.5  # seconds
+PRINT_RETRY_DELAY = 2.5  # seconds (base delay; backs off on each retry)
+PRINT_RETRY_BACKOFF = 1.6  # exponential factor applied to the delay
+PRINT_RETRY_MAX_DELAY = 12.0  # cap so waking a sleeping printer stays bounded
 
 app = Flask(__name__)
 
@@ -1301,6 +1303,76 @@ def prepare_text_serials(entries, generate_missing=True):
     return prepared
 
 
+def _parse_usb_vid_pid(printer_uri):
+    """Extract (vendor_id, product_id) ints from a usb:// URI, else None."""
+    if not printer_uri.startswith("usb://"):
+        return None
+
+    body = printer_uri[len("usb://"):]
+
+    # Strip an optional serial suffix: usb://0x04f9:0x209b/000J...
+    body = body.split("/", 1)[0]
+
+    if ":" not in body:
+        return None
+
+    vid_str, pid_str = body.split(":", 1)
+
+    try:
+        return (int(vid_str, 16), int(pid_str, 16))
+    except ValueError:
+        return None
+
+
+def reset_usb_printer():
+    """
+    Recover a wedged / re-enumerated / just-woken QL printer on the USB bus.
+
+    An "Input/output error" (usb.core.USBError) usually means the kernel's
+    usblp driver grabbed the interface, or the printer re-enumerated after a
+    previous job or after auto-sleep, leaving brother_ql with a stale handle.
+    Resetting the device and detaching the kernel driver clears that state so
+    the *next* send attempt starts from a clean handle instead of reusing the
+    broken one.
+
+    Best-effort: any failure here is swallowed -- it only exists to improve
+    the odds of the following retry succeeding.
+    """
+    ids = _parse_usb_vid_pid(PRINTER)
+
+    if not ids:
+        return
+
+    vid, pid = ids
+
+    try:
+        dev = usb.core.find(idVendor=vid, idProduct=pid)
+
+        if dev is None:
+            # Not on the bus yet -- likely still re-enumerating after
+            # waking from sleep. The retry delay gives it time to appear.
+            return
+
+        # Take the interface away from the usblp kernel driver if it grabbed
+        # it; this is the #1 cause of the I/O error on Linux.
+        try:
+            if dev.is_kernel_driver_active(0):
+                dev.detach_kernel_driver(0)
+        except (usb.core.USBError, NotImplementedError):
+            pass
+
+        # A bus-level reset forces a clean re-enumeration and drops the
+        # stale handle brother_ql would otherwise reuse.
+        try:
+            dev.reset()
+        except usb.core.USBError:
+            pass
+
+    except usb.core.USBError:
+        # Nothing more we can do here; let the retry loop wait and try again.
+        pass
+
+
 def print_images(images, label_size):
     if not images:
         raise ValueError(
@@ -1325,6 +1397,7 @@ def print_images(images, label_size):
     )
 
     last_error = None
+    delay = PRINT_RETRY_DELAY
 
     for attempt in range(1, PRINT_MAX_RETRIES + 1):
         try:
@@ -1342,15 +1415,28 @@ def print_images(images, label_size):
             return  # success
 
         except (usb.core.USBError, ValueError) as e:
-            # brother_ql's pyusb backend raises a plain ValueError
-            # ("Device not found") when its own usb.core.find() scan
-            # comes up empty mid-enumeration -- this is the same
-            # transient condition as a USBError, just a different
-            # exception type, so it needs the same retry treatment.
-            # Any other ValueError (e.g. a bad label size) should not
-            # be retried and should surface immediately.
-            if isinstance(e, ValueError) and str(e) != "Device not found":
-                raise
+            # Retryable, transient conditions on the USB link:
+            #   * usb.core.USBError -- includes "Input/output error"
+            #     (errno 5) raised when the kernel usblp driver holds the
+            #     interface, or when the printer re-enumerated / woke from
+            #     sleep and the handle went stale mid-transfer.
+            #   * ValueError from brother_ql's pyusb backend, which raises a
+            #     plain ValueError ("Device not found" / "Unable to find")
+            #     when its own usb.core.find() scan comes up empty during
+            #     re-enumeration.
+            # Any *other* ValueError (e.g. a bad label size) is a real
+            # programming/config error and must surface immediately.
+            if isinstance(e, ValueError):
+                msg = str(e).lower()
+                transient_value_error = (
+                    "not found" in msg
+                    or "no such device" in msg
+                    or "unable to find" in msg
+                    or "no backend" in msg
+                )
+
+                if not transient_value_error:
+                    raise
 
             last_error = e
 
@@ -1360,15 +1446,33 @@ def print_images(images, label_size):
             )
 
             if attempt < PRINT_MAX_RETRIES:
-                time.sleep(PRINT_RETRY_DELAY)
+                # Actively clear the stuck state (detach usblp, reset the
+                # device) BEFORE waiting, so the next attempt gets a clean
+                # handle instead of hitting the same I/O error again.
+                reset_usb_printer()
+
+                time.sleep(delay)
+                delay = min(
+                    delay * PRINT_RETRY_BACKOFF,
+                    PRINT_RETRY_MAX_DELAY
+                )
                 continue
 
     raise RuntimeError(
         "Printer unreachable after "
         f"{PRINT_MAX_RETRIES} attempts: {last_error}\n\n"
-        "The QL-800 may have gone to sleep or been re-enumerated. "
-        "Check 'lsusb' on the host and confirm the udev rule for "
-        "idVendor=04f9, idProduct=209b is in place."
+        "The QL-800 stopped responding (often 'Input/output error'). "
+        "Common causes and fixes:\n"
+        "  1. The Linux 'usblp' kernel driver grabbed the printer. "
+        "Blacklist it on the host: add 'blacklist usblp' to "
+        "/etc/modprobe.d/blacklist-usblp.conf, then 'modprobe -r usblp' "
+        "(or reboot).\n"
+        "  2. The printer auto-powered-off / went to sleep. Turn it back "
+        "on (or disable Auto Power-Off) and print again.\n"
+        "  3. The USB device re-enumerated. Check 'lsusb' on the host and "
+        "confirm the udev rule for idVendor=04f9, idProduct=209b is in "
+        "place, and that the container runs privileged with "
+        "/dev/bus/usb mapped."
     ) from last_error
 
 
