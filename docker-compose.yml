@@ -1,0 +1,32 @@
+services:
+  label-bench:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    ports:
+      - "8013:8013"
+
+    environment:
+      PRINTER_MODEL: "QL-800"
+      PRINTER: "usb://0x04f9:0x209b"
+      DEFAULT_LABEL_SIZE: "62"
+      PORT: "8013"
+      SERIAL_DB: "/app/data/label_serials.db"
+
+    # Give the container direct access to the USB bus.
+    # Required for Brother-QL usb:// printing.
+    devices:
+      - "/dev/bus/usb:/dev/bus/usb"
+
+    volumes:
+      - ./data:/app/data
+
+    # Required: brother_ql calls detach_kernel_driver() to pry the
+    # interface away from the Linux usblp kernel driver. That needs
+    # CAP_SYS_ADMIN, which only privileged mode grants -- the udev
+    # rule + device mapping alone only cover file permissions on the
+    # /dev node, not this kernel capability.
+    privileged: true
+
+    restart: unless-stopped
