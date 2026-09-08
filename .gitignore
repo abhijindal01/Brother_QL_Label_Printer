@@ -1,0 +1,18 @@
+# Runtime data (SQLite serials DB lives here via the ./data volume)
+data/
+*.db
+*.db-journal
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / editors
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
