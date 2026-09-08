@@ -9,15 +9,35 @@ services:
 
     environment:
       PRINTER_MODEL: "QL-800"
+      # Friendly name shown in the UI (tab title, sidebar, status).
+      PRINTER_DISPLAY_NAME: "Brother QL-800"
       PRINTER: "usb://0x04f9:0x209b"
       DEFAULT_LABEL_SIZE: "62"
       PORT: "8013"
       SERIAL_DB: "/app/data/label_serials.db"
+      # --- Printer resilience (see PRINTER_TROUBLESHOOTING.md) ---
+      # Attempts per print job on the primary URI (progressive backoff).
+      PRINT_MAX_RETRIES: "5"
+      # Base delay (s) between attempts; grows ~50% per attempt.
+      PRINT_RETRY_DELAY: "2.5"
+      # Settle time (s) after waking an autosuspended device.
+      PRINT_WAKE_WAIT: "1.5"
+      # Seconds to wait for the printer's completion status reply.
+      PRINT_STATUS_TIMEOUT: "10"
+      # Auto-fallback between usb:// and file:///dev/usb/lp* backends.
+      PRINTER_AUTO_FALLBACK: "1"
+      # Extra fallback URIs (comma-separated), e.g. "file:///dev/usb/lp0".
+      PRINTER_FALLBACKS: ""
 
     # Give the container direct access to the USB bus.
     # Required for Brother-QL usb:// printing.
     devices:
       - "/dev/bus/usb:/dev/bus/usb"
+      # Optional: if your host exposes the printer as /dev/usb/lp0 and you
+      # want the linux_kernel fallback backend (file:///dev/usb/lp0), add:
+      #   - "/dev/usb/lp0:/dev/usb/lp0"
+      # Only add it when the node exists on the host -- Docker refuses to
+      # start the container if a mapped device path is missing.
 
     volumes:
       - ./data:/app/data

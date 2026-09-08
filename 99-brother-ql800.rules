@@ -1,0 +1,24 @@
+# Brother QL-800 udev rule (install on the Docker *host*, not in the container).
+#
+# Install:
+#   sudo cp 99-brother-ql800.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   # then unplug the printer for 10s, replug, and retry printing.
+#
+# What it does:
+#   - Makes the raw USB node (used by the pyusb backend, usb://...) and the
+#     kernel lp node (used by the linux_kernel backend, file:///dev/usb/lp0)
+#     readable/writable so the container can open them.
+#   - Disables Linux USB autosuspend for this printer. NOTE: this is separate
+#     from the printer's own "auto off" setting -- even with auto-off disabled
+#     on the QL-800, the *OS* can still suspend the USB port, which is the most
+#     common cause of "Printer unreachable" flapping.
+#
+# Verify on the host:
+#   lsusb | grep 04f9
+#   ls -la /dev/bus/usb/*/* /dev/usb/lp* 2>/dev/null
+
+SUBSYSTEM=="usb", ATTR{idVendor}=="04f9", ATTR{idProduct}=="209b", MODE="0666", GROUP="plugdev"
+KERNEL=="lp[0-9]*", SUBSYSTEM=="usb", MODE="0666", GROUP="lp"
+# Keep the port powered: power/control "on" disables autosuspend for QL-800.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="04f9", ATTR{idProduct}=="209b", TEST=="power/control", ATTR{power/control}="on"
