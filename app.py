@@ -9,6 +9,7 @@ import traceback
 import re
 import logging
 import threading
+import socket
 from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify, render_template, render_template_string
@@ -74,7 +75,7 @@ PRINTER_AUTO_FALLBACK = str(
 app = Flask(__name__)
 
 APP_NAME = "Label Bench"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 MODEL = os.environ.get("PRINTER_MODEL", "QL-800")
 
@@ -88,6 +89,25 @@ PRINTER = os.environ.get("PRINTER", "usb://0x04f9:0x209b")
 
 DEFAULT_LABEL_SIZE = os.environ.get("DEFAULT_LABEL_SIZE", "62")
 SERIAL_DB = os.environ.get("SERIAL_DB", "/app/data/label_serials.db")
+
+# Brother QL models the app can drive. The QL-800 itself is USB-only;
+# the W/NW models add Wi-Fi (and print via tcp://HOST:9100).
+PRINTER_MODELS = [
+    {"id": "QL-800", "label": "QL-800 (USB)", "wireless": False},
+    {"id": "QL-810W", "label": "QL-810W (USB / Wi-Fi)", "wireless": True},
+    {"id": "QL-820NWB", "label": "QL-820NWB (USB / Wi-Fi / Bluetooth)", "wireless": True},
+    {"id": "QL-1100", "label": "QL-1100 (USB)", "wireless": False},
+    {"id": "QL-1110NWB", "label": "QL-1110NWB (USB / Wi-Fi / Bluetooth)", "wireless": True},
+]
+PRINTER_MODEL_IDS = {m["id"] for m in PRINTER_MODELS}
+
+# Default raw-socket (JetDirect/AppSocket) port Brother Wi-Fi printers
+# listen on. This is what brother_ql's network backend speaks.
+NETWORK_PRINTER_PORT = 9100
+# Timeout for TCP connectivity probes (status page, Test button).
+NETWORK_PROBE_TIMEOUT = max(
+    1.0, _env_float("NETWORK_PROBE_TIMEOUT", 3.0)
+)
 
 # Serialize all USB access: concurrent Flask requests must never talk to
 # the printer at the same time, otherwise libusb returns "Resource busy"
@@ -160,6 +180,108 @@ def init_db():
             conn.execute(
                 "ALTER TABLE used_serials ADD COLUMN text_content TEXT"
             )
+
+        # Key/value store for UI-configurable settings. The printer
+        # connection (URI / model / display name) chosen in the Printer
+        # panel is persisted here and overrides the env-var defaults.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+
+
+def get_setting(key, default=None):
+    """Read one persisted setting; env/DB failures fall back to default."""
+    try:
+        init_db()
+        with sqlite3.connect(SERIAL_DB) as conn:
+            row = conn.execute(
+                "SELECT value FROM app_settings WHERE key=?",
+                (key,),
+            ).fetchone()
+    except Exception:
+        return default
+    return row[0] if row else default
+
+
+def set_setting(key, value):
+    init_db()
+    with sqlite3.connect(SERIAL_DB) as conn:
+        conn.execute(
+            "INSERT INTO app_settings(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+
+
+def delete_setting(key):
+    try:
+        init_db()
+        with sqlite3.connect(SERIAL_DB) as conn:
+            conn.execute("DELETE FROM app_settings WHERE key=?", (key,))
+    except Exception:
+        pass
+
+
+def active_printer_uri():
+    """Effective printer URI: UI setting wins, else the PRINTER env var."""
+    saved = (get_setting("printer_uri", "") or "").strip()
+    return saved or PRINTER
+
+
+def active_model():
+    """Effective driver model: UI setting wins, else PRINTER_MODEL env."""
+    saved = (get_setting("printer_model", "") or "").strip()
+    if saved in PRINTER_MODEL_IDS:
+        return saved
+    return MODEL if MODEL in PRINTER_MODEL_IDS else "QL-800"
+
+
+def active_display_name():
+    """Effective friendly printer name shown across the UI."""
+    saved = (get_setting("printer_display_name", "") or "").strip()
+    if saved:
+        return saved
+    if PRINTER_DISPLAY_NAME:
+        return PRINTER_DISPLAY_NAME
+    return f"Brother {active_model()}"
+
+
+def connection_type_of(uri):
+    uri = str(uri or "").strip()
+    if uri.startswith("tcp://"):
+        return "network"
+    if uri.startswith("file://") or uri.startswith("/dev/"):
+        return "file"
+    return "usb"
+
+
+def get_printer_config():
+    """Effective printer config + where each value came from (for the UI)."""
+    uri = active_printer_uri()
+    return {
+        "uri": uri,
+        "connection": connection_type_of(uri),
+        "model": active_model(),
+        "display_name": active_display_name(),
+        "sources": {
+            "uri": "settings" if (get_setting("printer_uri", "") or "").strip() else "env",
+            "model": "settings" if (get_setting("printer_model", "") or "").strip() else "env",
+            "display_name": (
+                "settings"
+                if (get_setting("printer_display_name", "") or "").strip()
+                else "env"
+            ),
+        },
+        "env_defaults": {
+            "uri": PRINTER,
+            "model": MODEL,
+            "display_name": PRINTER_DISPLAY_NAME,
+        },
+        "models": PRINTER_MODELS,
+    }
 
 
 def list_fonts():
@@ -1413,6 +1535,99 @@ def parse_usb_uri(uri):
     )
 
 
+_TCP_URI_RE = re.compile(r"^tcp://([^:/\s]+)(?::(\d+))?/?$")
+
+
+def parse_tcp_uri(uri):
+    """Parse 'tcp://HOST[:PORT]' -> (host, port). Default port 9100."""
+    if not isinstance(uri, str):
+        return None
+    match = _TCP_URI_RE.match(uri.strip())
+    if not match:
+        return None
+    host = match.group(1)
+    try:
+        port = int(match.group(2)) if match.group(2) else NETWORK_PRINTER_PORT
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    return host, port
+
+
+def probe_tcp_uri(uri, timeout=None):
+    """Check whether a tcp:// printer answers on its raw-socket port.
+
+    Opens a short TCP connection (default 3 s timeout) without sending
+    any print data, so this is safe to call from status polls.
+    """
+    parsed = parse_tcp_uri(uri)
+    if parsed is None:
+        return {
+            "present": False,
+            "uri": uri,
+            "backend": "network",
+            "error": (
+                f"Unrecognised network printer URI '{uri}'. Expected "
+                "'tcp://HOST[:PORT]' (e.g. tcp://192.168.1.50:9100)."
+            ),
+        }
+    host, port = parsed
+    timeout = NETWORK_PROBE_TIMEOUT if timeout is None else timeout
+    start = time.time()
+    sock = None
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except socket.timeout:
+        return {
+            "present": False,
+            "uri": uri,
+            "backend": "network",
+            "host": host,
+            "port": port,
+            "error": (
+                f"Connection to {host}:{port} timed out after "
+                f"{timeout:.0f}s. The printer may be offline, asleep, "
+                "or unreachable from this network."
+            ),
+        }
+    except socket.gaierror:
+        return {
+            "present": False,
+            "uri": uri,
+            "backend": "network",
+            "host": host,
+            "port": port,
+            "error": (
+                f"Could not resolve host '{host}'. Check the printer's "
+                "IP address / hostname."
+            ),
+        }
+    except OSError as e:
+        return {
+            "present": False,
+            "uri": uri,
+            "backend": "network",
+            "host": host,
+            "port": port,
+            "error": f"Could not reach {host}:{port}: {e}",
+        }
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+    return {
+        "present": True,
+        "uri": uri,
+        "backend": "network",
+        "host": host,
+        "port": port,
+        "latency_ms": round((time.time() - start) * 1000),
+    }
+
+
 def usb_backend_available():
     """Check that libusb is usable from inside this process/container."""
     try:
@@ -1580,14 +1795,9 @@ def probe_printer_uri(uri):
             )
         return result
     if uri.startswith("tcp://"):
-        # Network printers cannot be probed cheaply without opening a
-        # socket; report as unknown and let the print attempt decide.
-        return {
-            "uri": uri,
-            "backend": "network",
-            "present": None,
-            "note": "Network URIs are only tested during printing.",
-        }
+        # A short TCP connect is cheap and safe (no data sent), so Wi-Fi
+        # printers get a real present/absent answer just like USB ones.
+        return probe_tcp_uri(uri)
     return {
         "uri": uri,
         "backend": None,
@@ -1598,10 +1808,11 @@ def probe_printer_uri(uri):
 
 def probe_printer():
     """Full printer health snapshot for /api/status and diagnostics."""
+    printer_uri = active_printer_uri()
     backend_ok, backend_error = usb_backend_available()
     usb_devices, usb_scan_error = list_brother_usb_devices()
     kernel_devices = list_linux_kernel_devices()
-    primary = probe_printer_uri(PRINTER)
+    primary = probe_printer_uri(printer_uri)
 
     present = bool(primary.get("present"))
     detail = primary.get("error") or primary.get("note")
@@ -1614,7 +1825,7 @@ def probe_printer():
             if alt.get("present"):
                 detail = (
                     (detail + " " if detail else "")
-                    + f"Primary {PRINTER} is not visible, but fallback "
+                    + f"Primary {printer_uri} is not visible, but fallback "
                     f"{candidate} is present and will be tried."
                 )
                 break
@@ -1622,9 +1833,10 @@ def probe_printer():
     return {
         "app": APP_NAME,
         "version": APP_VERSION,
-        "model": MODEL,
-        "printer_display_name": PRINTER_DISPLAY_NAME,
-        "printer": PRINTER,
+        "model": active_model(),
+        "printer_display_name": active_display_name(),
+        "printer": printer_uri,
+        "connection": connection_type_of(printer_uri),
         "device_present": present,
         "device_path": printer_device_path(),
         "primary": primary,
@@ -1651,20 +1863,21 @@ def printer_device_present():
     node, so the UI status dot reflects reality.
     """
     try:
-        return bool(probe_printer_uri(PRINTER).get("present"))
+        return bool(probe_printer_uri(active_printer_uri()).get("present"))
     except Exception:
         return False
 
 
 def printer_device_path():
-    if PRINTER.startswith("file://"):
-        return PRINTER.replace(
+    uri = active_printer_uri()
+    if uri.startswith("file://"):
+        return uri.replace(
             "file://",
             "",
             1
         )
 
-    return PRINTER
+    return uri
 
 
 def resolve_printer_candidates():
@@ -1675,6 +1888,11 @@ def resolve_printer_candidates():
         the configured PID is slightly off, e.g. QL-800 vs QL-810W), and
       * any /dev/usb/lp* node (handles hosts where usblp claimed the
         printer and pyusb cannot detach it).
+
+    Auto-discovery is skipped when the primary is a network (Wi-Fi)
+    printer: a USB device on this host would be a *different physical*
+    printer, and silently printing there would be surprising. Explicit
+    PRINTER_FALLBACKS are still honoured for network primaries.
     """
     candidates = []
     seen = set()
@@ -1685,16 +1903,17 @@ def resolve_printer_candidates():
             seen.add(uri)
             candidates.append(uri)
 
-    add(PRINTER)
+    primary = active_printer_uri()
+    add(primary)
     for fallback in PRINTER_FALLBACKS:
         add(fallback)
 
-    if PRINTER_AUTO_FALLBACK:
+    if PRINTER_AUTO_FALLBACK and connection_type_of(primary) != "network":
         try:
             usb_devices, _ = list_brother_usb_devices()
         except Exception:
             usb_devices = []
-        configured = parse_usb_uri(PRINTER)
+        configured = parse_usb_uri(primary)
         for entry in usb_devices:
             ident = entry.get("identifier")
             if not ident:
@@ -1713,7 +1932,7 @@ def resolve_printer_candidates():
         for entry in list_linux_kernel_devices():
             add(entry.get("identifier"))
 
-    return candidates or [PRINTER]
+    return candidates or [primary]
 
 
 def _is_retryable_open_error(exc):
@@ -1873,6 +2092,9 @@ def _wake_probe(printer_uri):
 def _troubleshooting_hint(last_error_text, tried_uris):
     lines = []
     text = (last_error_text or "").lower()
+    via_network = any(
+        str(u or "").startswith("tcp://") for u in (tried_uris or [])
+    )
 
     if "no backend" in text or "libusb" in text:
         lines.append(
@@ -1925,6 +2147,26 @@ def _troubleshooting_hint(last_error_text, tried_uris):
             "label roll is loaded, the cover is closed, and the correct "
             "label size is selected."
         )
+    if (
+        via_network
+        or "connection refused" in text
+        or "name or service not known" in text
+        or "nodename nor servname" in text
+        or "no route to host" in text
+        or "network is unreachable" in text
+    ):
+        lines.append(
+            "- Network (Wi-Fi) printer unreachable: confirm the printer is "
+            "connected to Wi-Fi (Wi-Fi LED lit), the IP/hostname is "
+            "correct, and port 9100 is reachable from the Docker host "
+            "(try: nc -zv PRINTER_IP 9100). Give the printer a static IP "
+            "or DHCP reservation so the address never changes."
+        )
+        lines.append(
+            "- Note: the QL-800 is USB-only. Wi-Fi printing needs a "
+            "QL-810W / QL-820NWB / QL-1110NWB with the matching Model "
+            "selected in the Printer panel."
+        )
     if not lines:
         lines.append(
             "- Check the cable/power, run 'lsusb | grep 04f9' on the host, "
@@ -1947,7 +2189,12 @@ def try_usb_reset(printer_uri=None):
 
     Returns (ok: bool, message: str). Never raises.
     """
-    uri = printer_uri or PRINTER
+    uri = printer_uri or active_printer_uri()
+    if connection_type_of(uri) == "network":
+        return False, (
+            "USB reset only applies to USB printers. For a Wi-Fi "
+            "printer, power-cycle it or use Reconnect instead."
+        )
     parsed = parse_usb_uri(uri)
     if parsed is None:
         # Try every visible Brother device as a fallback.
@@ -2017,7 +2264,7 @@ def print_images(images, label_size):
 
 
 def _print_images_locked(images, label_size):
-    qlr = BrotherQLRaster(MODEL)
+    qlr = BrotherQLRaster(active_model())
     qlr.exception_on_warning = True
 
     convert(
@@ -2060,7 +2307,21 @@ def _print_images_locked(images, label_size):
                     "print attempt %d/%d via %s (%d bytes)",
                     attempt, budget, uri, len(qlr.data),
                 )
-                result = _send_once(qlr.data, uri)
+                if connection_type_of(uri) == "network":
+                    # brother_ql's network backend calls blocking
+                    # connect() with no timeout: bound it so a Wi-Fi
+                    # printer that drops mid-job can't hang the
+                    # request for minutes. (Probes pass explicit
+                    # timeouts, so they are unaffected; prints are
+                    # serialised by _PRINT_LOCK.)
+                    previous_timeout = socket.getdefaulttimeout()
+                    socket.setdefaulttimeout(15)
+                    try:
+                        result = _send_once(qlr.data, uri)
+                    finally:
+                        socket.setdefaulttimeout(previous_timeout)
+                else:
+                    result = _send_once(qlr.data, uri)
             except Exception as e:
                 retryable, reason = _is_retryable_open_error(e)
                 last_error = e
@@ -2135,13 +2396,18 @@ def _print_images_locked(images, label_size):
 
             # Success (or uncertain-but-sent). did_print/ready flags are
             # informational: some firmware revisions never emit the full
-            # sequence even though the label printed.
+            # sequence even though the label printed. The network
+            # backend never reads status back at all, so 'sent' is a
+            # full success for Wi-Fi printers, not a warning.
             now = datetime.now(timezone.utc).isoformat()
             _PRINTER_STATE["last_error"] = None
             _PRINTER_STATE["last_error_at"] = None
             _PRINTER_STATE["last_success_at"] = now
             _PRINTER_STATE["consecutive_failures"] = 0
             _PRINTER_STATE["last_printer_used"] = uri
+            if result.get("backend") == "network":
+                logger.info("[print_images] sent via %s (network)", uri)
+                return {"uri": uri, "backend": "network"}
             if not result.get("did_print") or not result.get("ready_for_next_job"):
                 logger.warning(
                     "[print_images] sent via %s but completion status "
@@ -2197,8 +2463,9 @@ def index():
     context = dict(
         app_name=APP_NAME,
         app_version=APP_VERSION,
-        model=MODEL,
-        printer_display_name=PRINTER_DISPLAY_NAME,
+        model=active_model(),
+        printer_display_name=active_display_name(),
+        printer_models=PRINTER_MODELS,
         label_sizes=sorted(
             LABEL_SPECS.keys()
         ),
@@ -2557,8 +2824,11 @@ def api_print():
         # probe: a sleeping/autosuspended printer often answers only
         # after the retry loop's wake sequence, so the print attempt
         # itself (with retries + fallbacks) is the real test.
+        # For tcp:// (Wi-Fi) URIs we DO pre-probe: a dead host would
+        # otherwise burn the whole retry budget on TCP timeouts.
+        primary_uri = active_printer_uri()
         if (
-            PRINTER.startswith("file://")
+            primary_uri.startswith("file://")
             and not printer_device_present()
             and not PRINTER_FALLBACKS
         ):
@@ -2575,6 +2845,17 @@ def api_print():
                 "Or set PRINTER to the correct Brother-QL printer URI "
                 "(e.g. usb://0x04f9:0x209b)."
             )
+
+        if connection_type_of(primary_uri) == "network":
+            probe = probe_printer_uri(primary_uri)
+            if not probe.get("present"):
+                hint = _troubleshooting_hint(
+                    probe.get("error", ""), [primary_uri]
+                )
+                raise RuntimeError(
+                    f"Network printer unreachable: "
+                    f"{probe.get('error', 'unknown error')}\n\n{hint}"
+                )
 
         payload = parse_payload_from_request()
 
@@ -2682,9 +2963,9 @@ def api_status():
             "ok": True,
             "app": APP_NAME,
             "version": APP_VERSION,
-            "model": MODEL,
-            "printer_display_name": PRINTER_DISPLAY_NAME,
-            "printer": PRINTER,
+            "model": active_model(),
+            "printer_display_name": active_display_name(),
+            "printer": active_printer_uri(),
             "device_present": False,
             "device_path": printer_device_path(),
             "detail": f"Status probe failed: {e}",
@@ -2711,9 +2992,13 @@ def api_printer_diagnostics():
     """Live USB/kernel visibility + config, for troubleshooting."""
     try:
         snapshot = probe_printer()
+        effective = get_printer_config()
         snapshot["config"] = {
-            "model": MODEL,
-            "printer": PRINTER,
+            "model": effective["model"],
+            "printer": effective["uri"],
+            "display_name": effective["display_name"],
+            "sources": effective["sources"],
+            "env_defaults": effective["env_defaults"],
             "fallbacks_configured": PRINTER_FALLBACKS,
             "auto_fallback": PRINTER_AUTO_FALLBACK,
             "max_retries": PRINT_MAX_RETRIES,
@@ -2741,7 +3026,7 @@ def api_printer_reconnect():
         messages = []
         if parse_bool(payload.get("reset")):
             ok, message = try_usb_reset(
-                payload.get("printer") or PRINTER
+                payload.get("printer") or active_printer_uri()
             )
             messages.append(message)
             if not ok:
@@ -2753,11 +3038,167 @@ def api_printer_reconnect():
             # Give the firmware a moment after reset before probing.
             time.sleep(1.0)
         else:
-            _wake_probe(payload.get("printer") or PRINTER)
+            _wake_probe(payload.get("printer") or active_printer_uri())
         snapshot = probe_printer()
         snapshot["ok"] = True
         snapshot["messages"] = messages
         return jsonify(snapshot)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+_HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9\-.]{0,251}[A-Za-z0-9])?$")
+
+
+def _validate_printer_config_payload(payload):
+    """Validate the Printer panel form into (uri, model, display_name).
+
+    Raises ValueError with a user-friendly message on bad input.
+    """
+    payload = payload or {}
+    connection = str(payload.get("connection", "")).strip().lower()
+    if connection not in ("usb", "network"):
+        raise ValueError(
+            "Connection must be 'usb' or 'network' (Wi-Fi)."
+        )
+
+    if connection == "usb":
+        uri = str(payload.get("usb_uri", "")).strip()
+        if parse_usb_uri(uri) is None:
+            raise ValueError(
+                f"Invalid USB printer URI '{uri}'. Expected "
+                "'usb://0xVVVV:0xPPPP' (e.g. usb://0x04f9:0x209b)."
+            )
+    else:
+        host = str(payload.get("host", "")).strip()
+        if not host or not _HOST_RE.match(host):
+            raise ValueError(
+                f"Invalid printer host '{host}'. Enter the printer's IP "
+                "address (e.g. 192.168.1.50) or hostname."
+            )
+        try:
+            port = int(payload.get("port", NETWORK_PRINTER_PORT))
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Invalid port '{payload.get('port')}'. Use 9100 unless "
+                "your printer was configured otherwise."
+            )
+        if not 1 <= port <= 65535:
+            raise ValueError(
+                f"Invalid port '{port}'. Use a value between 1 and 65535 "
+                "(Brother Wi-Fi printers use 9100)."
+            )
+        uri = f"tcp://{host}:{port}"
+
+    model = str(payload.get("model", "")).strip()
+    if model not in PRINTER_MODEL_IDS:
+        raise ValueError(
+            f"Unknown model '{model}'. Choose one of: "
+            + ", ".join(sorted(PRINTER_MODEL_IDS))
+            + "."
+        )
+
+    display_name = str(payload.get("display_name", "")).strip()
+    return uri, model, display_name
+
+
+@app.route("/api/printer/config")
+def api_printer_config_get():
+    """Effective printer config for the Printer settings panel."""
+    try:
+        config = get_printer_config()
+        config["probe"] = probe_printer_uri(config["uri"])
+        config["ok"] = True
+        return jsonify(config)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/printer/config", methods=["POST"])
+def api_printer_config_save():
+    """Save the printer connection chosen in the Printer panel.
+
+    Persists to SQLite and takes effect immediately for status,
+    diagnostics and subsequent prints.
+    """
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        uri, model, display_name = _validate_printer_config_payload(payload)
+
+        set_setting("printer_uri", uri)
+        set_setting("printer_model", model)
+        if display_name:
+            set_setting("printer_display_name", display_name)
+        else:
+            delete_setting("printer_display_name")
+
+        warnings = []
+        if connection_type_of(uri) == "network" and not next(
+            (m for m in PRINTER_MODELS if m["id"] == model),
+            {"wireless": True},
+        )["wireless"]:
+            warnings.append(
+                f"Note: the {model} has no Wi-Fi. Network printing to it "
+                "only works through a USB print server. For native Wi-Fi, "
+                "use a QL-810W / QL-820NWB / QL-1110NWB."
+            )
+
+        config = get_printer_config()
+        probe = probe_printer_uri(config["uri"])
+        config["probe"] = probe
+        config["warnings"] = warnings
+        config["ok"] = True
+        logger.info(
+            "printer config saved: %s (%s, %s)",
+            uri, model, config["display_name"],
+        )
+        return jsonify(config)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/printer/config/reset", methods=["POST"])
+def api_printer_config_reset():
+    """Clear UI overrides and return to the env-var configuration."""
+    try:
+        delete_setting("printer_uri")
+        delete_setting("printer_model")
+        delete_setting("printer_display_name")
+        config = get_printer_config()
+        config["probe"] = probe_printer_uri(config["uri"])
+        config["ok"] = True
+        return jsonify(config)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/printer/test", methods=["POST"])
+def api_printer_test():
+    """Probe a printer URI without saving it (Test button).
+
+    Body: {"uri": "tcp://192.168.1.50:9100"} or a config-style payload
+    {"connection": ..., ...} which is validated first.
+    """
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        uri = str(payload.get("uri", "")).strip()
+        if not uri and payload.get("connection"):
+            uri, _model, _name = _validate_printer_config_payload(payload)
+        if not uri:
+            raise ValueError(
+                "Provide a printer URI or a connection payload to test."
+            )
+        result = probe_printer_uri(uri)
+        result["ok"] = True
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
     except Exception as e:
         traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500

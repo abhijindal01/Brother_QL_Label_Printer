@@ -632,6 +632,7 @@
   <div class="nav-item" data-panel="image">Image upload</div>
   <div class="nav-item" data-panel="batch">Batch run</div>
   <div class="nav-item" data-panel="summary">Summary</div>
+  <div class="nav-item" data-panel="printer">Printer</div>
 
   <div class="status">
     <span class="dot warn" id="status-dot"></span>
@@ -1267,6 +1268,155 @@
       </div>
     </div>
 
+
+    <!-- PRINTER -->
+    <div class="panel" data-panel="printer">
+      <h2>Printer</h2>
+
+      <p class="subtitle">
+        Choose how this app reaches your label printer — USB cable or
+        Wi-Fi network. Saved here, takes effect immediately.
+      </p>
+
+      <label class="field-label">Connection</label>
+
+      <div class="radio-group" style="margin-bottom:16px">
+        <label>
+          <input
+            type="radio"
+            name="printer-conn"
+            value="usb"
+            checked
+            onchange="togglePrinterFields()"
+          >
+          USB cable
+        </label>
+
+        <label>
+          <input
+            type="radio"
+            name="printer-conn"
+            value="network"
+            onchange="togglePrinterFields()"
+          >
+          Network (Wi-Fi)
+        </label>
+      </div>
+
+      <div id="printer-usb-fields">
+        <label class="field-label">USB printer URI</label>
+
+        <input
+          type="text"
+          id="printer-usb-uri"
+          value="usb://0x04f9:0x209b"
+          placeholder="usb://0x04f9:0x209b"
+          spellcheck="false"
+          style="font-family:monospace"
+        >
+
+        <div class="hint">
+          Find it with <code>lsusb | grep 04f9</code> on the Docker host,
+          e.g. <code>ID 04f9:209b</code> → <code>usb://0x04f9:0x209b</code>.
+        </div>
+      </div>
+
+      <div id="printer-net-fields" style="display:none">
+        <div class="row">
+          <div>
+            <label class="field-label">Printer IP address or hostname</label>
+
+            <input
+              type="text"
+              id="printer-host"
+              placeholder="192.168.1.50"
+              spellcheck="false"
+              style="font-family:monospace"
+            >
+          </div>
+
+          <div style="max-width:140px">
+            <label class="field-label">Port</label>
+
+            <input
+              type="number"
+              id="printer-port"
+              value="9100"
+              min="1"
+              max="65535"
+            >
+          </div>
+        </div>
+
+        <div class="hint">
+          Find the IP on your router's client list, or print the printer's
+          network configuration label. Brother Wi-Fi printers listen on
+          port <b>9100</b>. Give the printer a static IP (or DHCP
+          reservation) so this never changes.
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:16px">
+        <div>
+          <label class="field-label">Printer model</label>
+
+          <select id="printer-model">
+            {% for m in printer_models %}
+              <option
+                value="{{ m.id }}"
+                {% if m.id == model %}selected{% endif %}
+              >
+                {{ m.label }}
+              </option>
+            {% endfor %}
+          </select>
+
+          <div class="hint">
+            The QL-800 is USB-only — for Wi-Fi pick a QL-810W, QL-820NWB
+            or QL-1110NWB.
+          </div>
+        </div>
+
+        <div>
+          <label class="field-label">Display name</label>
+
+          <input
+            type="text"
+            id="printer-display-name"
+            value="{{ printer_display_name }}"
+            placeholder="Brother QL-800"
+          >
+
+          <div class="hint">
+            Shown in the tab title, sidebar and status. Empty = default.
+          </div>
+        </div>
+      </div>
+
+      <div
+        class="hint"
+        id="printer-source-note"
+        style="margin-top:4px"
+      ></div>
+
+      <div class="actions" style="margin-top:16px">
+        <button onclick="testPrinterConfig()">
+          Test connection
+        </button>
+
+        <button
+          class="primary"
+          onclick="savePrinterConfig()"
+        >
+          Save printer
+        </button>
+
+        <button onclick="resetPrinterConfig()">
+          Reset to defaults
+        </button>
+      </div>
+    </div>
+
     <div id="message"></div>
 
   </div>
@@ -1318,6 +1468,10 @@ navItems.forEach(item => {
 
     if (item.dataset.panel === 'summary') {
       loadSummary();
+    }
+
+    if (item.dataset.panel === 'printer') {
+      loadPrinterConfig();
     }
   });
 });
@@ -2521,6 +2675,208 @@ async function showDiagnostics() {
       `- confirm the container maps /dev/bus/usb and keeps privileged: true\n` +
       `- try Reconnect, then USB reset, then unplug 10s / replug / wait 5s`;
     showMessage(data.device_present ? 'success' : 'error', msg);
+  } catch (e) {
+    showError(e.message);
+  }
+}
+
+
+function printerFormPayload() {
+  const conn = document.querySelector(
+    'input[name="printer-conn"]:checked'
+  );
+
+  return {
+    connection: conn ? conn.value : 'usb',
+    usb_uri: document.getElementById('printer-usb-uri').value.trim(),
+    host: document.getElementById('printer-host').value.trim(),
+    port: document.getElementById('printer-port').value,
+    model: document.getElementById('printer-model').value,
+    display_name: document.getElementById(
+      'printer-display-name'
+    ).value.trim()
+  };
+}
+
+
+function togglePrinterFields() {
+  const conn = document.querySelector(
+    'input[name="printer-conn"]:checked'
+  );
+
+  const isNet = conn && conn.value === 'network';
+
+  document.getElementById(
+    'printer-usb-fields'
+  ).style.display = isNet ? 'none' : '';
+
+  document.getElementById(
+    'printer-net-fields'
+  ).style.display = isNet ? '' : 'none';
+}
+
+
+function fillPrinterForm(data) {
+  const conn = data.connection === 'network' ? 'network' : 'usb';
+
+  document.querySelector(
+    `input[name="printer-conn"][value="${conn}"]`
+  ).checked = true;
+
+  if (conn === 'network') {
+    const m = /^tcp:\/\/([^:/\s]+)(?::(\d+))?/.exec(data.uri || '');
+
+    document.getElementById('printer-host').value =
+      (data.probe && data.probe.host) || (m && m[1]) || '';
+
+    document.getElementById('printer-port').value =
+      (data.probe && data.probe.port) || (m && m[2]) || 9100;
+  } else {
+    document.getElementById('printer-usb-uri').value = data.uri || '';
+  }
+
+  document.getElementById('printer-model').value =
+    data.model || 'QL-800';
+
+  document.getElementById('printer-display-name').value =
+    data.display_name || '';
+
+  const note = document.getElementById('printer-source-note');
+
+  if (note && data.sources) {
+    const saved =
+      data.sources.uri === 'settings' ||
+      data.sources.model === 'settings' ||
+      data.sources.display_name === 'settings';
+
+    note.textContent = saved
+      ? 'These values were saved in the app and override the Docker environment.'
+      : 'Using the Docker environment defaults — nothing saved in the app yet.';
+  }
+
+  togglePrinterFields();
+}
+
+
+async function loadPrinterConfig() {
+  try {
+    const resp = await fetch('/api/printer/config');
+    const data = await resp.json();
+
+    if (!resp.ok || !data.ok) {
+      throw new Error(data.error || 'Could not load printer config.');
+    }
+
+    fillPrinterForm(data);
+  } catch (e) {
+    showError(e.message);
+  }
+}
+
+
+async function testPrinterConfig() {
+  clearMessage();
+  showWarning('Testing connection…');
+
+  try {
+    const resp = await fetch('/api/printer/test', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(printerFormPayload())
+    });
+
+    const data = await resp.json();
+
+    if (!resp.ok || !data.ok) {
+      throw new Error(data.error || 'Connection test failed.');
+    }
+
+    if (data.present) {
+      let extra = '';
+
+      if (data.backend === 'network' && data.latency_ms != null) {
+        extra = ` (${data.latency_ms} ms)`;
+      } else if (data.bus != null) {
+        extra = ` (bus ${data.bus}, addr ${data.address})`;
+      }
+
+      showSuccess(`Connection OK: ${data.uri}${extra}`);
+    } else {
+      showError(
+        `Not reachable: ${data.uri}\n${data.error || ''}`.trim()
+      );
+    }
+  } catch (e) {
+    showError(e.message);
+  }
+}
+
+
+async function savePrinterConfig() {
+  clearMessage();
+
+  try {
+    const resp = await fetch('/api/printer/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(printerFormPayload())
+    });
+
+    const data = await resp.json();
+
+    if (!resp.ok || !data.ok) {
+      throw new Error(data.error || 'Could not save printer.');
+    }
+
+    fillPrinterForm(data);
+    await checkStatus();
+
+    let msg =
+      `Printer saved: ${data.display_name} (${data.uri}). ` +
+      'Takes effect immediately.';
+
+    if (data.probe && !data.probe.present) {
+      msg +=
+        `\nWarning: it is not reachable right now — ` +
+        `${data.probe.error || 'check connection and retry.'}`;
+    }
+
+    if (data.warnings && data.warnings.length) {
+      msg += '\n' + data.warnings.join('\n');
+    }
+
+    if (data.probe && data.probe.present) {
+      showSuccess(msg);
+    } else {
+      showWarning(msg);
+    }
+  } catch (e) {
+    showError(e.message);
+  }
+}
+
+
+async function resetPrinterConfig() {
+  clearMessage();
+
+  try {
+    const resp = await fetch('/api/printer/config/reset', {
+      method: 'POST'
+    });
+
+    const data = await resp.json();
+
+    if (!resp.ok || !data.ok) {
+      throw new Error(data.error || 'Could not reset printer config.');
+    }
+
+    fillPrinterForm(data);
+    await checkStatus();
+
+    showSuccess(
+      'Printer settings cleared — back to the Docker environment ' +
+      `defaults (${data.uri}).`
+    );
   } catch (e) {
     showError(e.message);
   }

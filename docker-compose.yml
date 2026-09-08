@@ -11,6 +11,9 @@ services:
       PRINTER_MODEL: "QL-800"
       # Friendly name shown in the UI (tab title, sidebar, status).
       PRINTER_DISPLAY_NAME: "Brother QL-800"
+      # Printer connection. USB: "usb://0x04f9:0x209b"
+      # Wi-Fi (QL-810W/QL-820NWB): "tcp://PRINTER_IP:9100"
+      # The Printer panel in the UI can override this at runtime.
       PRINTER: "usb://0x04f9:0x209b"
       DEFAULT_LABEL_SIZE: "62"
       PORT: "8013"

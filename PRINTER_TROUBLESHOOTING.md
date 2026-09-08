@@ -90,6 +90,21 @@ dmesg | tail -20
    `PRINTER_FALLBACKS: "usb://0x04f9:0x209b"` (or vice versa) so either
    backend can take over.
 
+## Wi-Fi printer checklist (QL-810W / QL-820NWB / QL-1110NWB)
+
+- The printer's **Wi-Fi LED** must be lit (joined to your network).
+- The container host must reach the printer: `nc -zv PRINTER_IP 9100`
+  (or `curl -v telnet://PRINTER_IP:9100`). Consumer routers sometimes
+  enable "client isolation" between Wi-Fi and wired clients — disable it.
+- Use a **static IP / DHCP reservation**; if the printer's IP changes, the
+  saved `tcp://…` URI goes stale. Re-run **Test connection** in the
+  Printer panel after network changes.
+- Select the matching **model** in the Printer panel (raster output
+  differs per model). `QL-800` + `tcp://` only works via a USB print
+  server — the app warns you in that case.
+- Unlike USB, Wi-Fi printing has **no status read-back**: "sent" counts as
+  success. If labels don't come out, check the roll/cover and the IP.
+
 ## Error message guide
 
 | Message fragment | Meaning | Action |
