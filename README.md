@@ -6,6 +6,7 @@ any browser on your network.
 
 - **Text labels** — unlimited rows with optional 5-digit unique codes, list / grid / boxed layouts
 - **QR codes, barcodes, image upload, batch runs** with `{n}` templating
+- **Unique codes in batch runs** — every label in a batch gets its own 5-digit code, generated automatically
 - **Live preview** that never touches the printer
 - **Resilient printing** — wake-from-sleep retries, automatic USB ↔ kernel-device fallback, clear error messages
 - **Print history** with per-code print counts
@@ -85,6 +86,40 @@ to a different QL-series printer.
 | `PRINTER_FALLBACKS` | _(empty)_ | Extra URIs to try, e.g. `file:///dev/usb/lp0` |
 | `PRINTER_AUTO_FALLBACK` | `1` | Auto-try discovered Brother USB / `/dev/usb/lp*` devices |
 
+## Unique codes in batch runs
+
+Batch runs can stamp a **unique 5-digit code** on every label, using the
+same code pool, history, and validation as manually entered codes.
+
+Pick how the code is placed with **Unique 5-digit code** in the Batch run
+panel:
+
+| Mode | Result |
+|---|---|
+| **Off** | No code — the template text only (default behaviour) |
+| **In the template (`{code}`)** | The code replaces `{code}` wherever it appears, e.g. `ITEM-{n}-{code}` → `ITEM-7-42867` |
+| **On its own line below the text** | The template text, with the code centred underneath (Text batches) |
+| **Both** | `{code}` is replaced *and* the code prints on its own line |
+
+Notes:
+
+- `{n}` is the batch counter; `{code}` (alias `{serial}`) is the unique
+  code. Both work anywhere in the template.
+- Codes are generated automatically on **Preview** and **Print** — there is
+  no separate button. The assigned codes are listed next to the preview
+  (with a **Copy** button) and recorded in **Summary** with their print
+  counts.
+- Re-running the same batch reuses the same codes, so reprints come out
+  identical. Where the code sits is a layout choice, not a different
+  batch: moving `{code}` out of the template (or back in) keeps the same
+  codes. To get a fresh set, delete the codes in **Summary**; deleted
+  codes are replaced on the next run.
+- Codes are reserved in one transaction, so a batch can never hand out a
+  code twice or half-succeed. If the 5-digit pool runs out, nothing is
+  reserved and the error tells you how many codes are left.
+- A batch that wants an inline code but has no `{code}` in its template is
+  rejected instead of silently printing uncoded labels.
+
 ## API overview
 
 | Endpoint | Description |
@@ -96,8 +131,8 @@ to a different QL-series printer.
 | `POST /api/printer/reconnect` | Wake / re-probe, optional `{"reset": true}` USB reset |
 | `GET/POST /api/printer/config` | Printer connection settings (UI-overridable) |
 | `POST /api/printer/test` | Probe a URI without saving it |
-| `POST /api/preview` | Render previews (never touches the printer) |
-| `POST /api/print` | Print labels |
+| `POST /api/preview` | Render previews (never touches the printer); batch runs return their assigned `batch_codes` |
+| `POST /api/print` | Print labels; batch runs return and record their `batch_codes` |
 | `POST /api/serial/*` | Unique-code generate / check / register |
 | `GET /api/summary` | Print history |
 
