@@ -381,6 +381,60 @@
     text-align: center;
   }
 
+  /* Unique codes assigned to the last batch run */
+  .codes-box {
+    margin-top: 14px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .codes-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+  }
+
+  .codes-head button {
+    padding: 5px 10px;
+    font-size: 12px;
+  }
+
+  .codes-list {
+    max-height: 260px;
+    overflow: auto;
+  }
+
+  .code-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 6px 12px;
+    font-family: monospace;
+    font-size: 13px;
+    border-bottom: 1px solid rgba(38, 44, 54, .55);
+  }
+
+  .code-row:last-child {
+    border-bottom: 0;
+  }
+
+  .code-n {
+    color: var(--muted);
+  }
+
+  .code-value {
+    font-weight: 600;
+    letter-spacing: 0.08em;
+  }
+
   .panel {
     display: none;
   }
@@ -1112,8 +1166,8 @@
       <h2>Batch run</h2>
 
       <p class="subtitle">
-        Print a sequence in one click — use
-        <code>{n}</code> in your template as the counter.
+        Print a sequence in one click — <code>{n}</code> is the counter and
+        <code>{code}</code> gives every label its own unique 5-digit code.
       </p>
 
       <div class="row">
@@ -1146,16 +1200,35 @@
         </div>
       </div>
 
-      <label class="field-label">
-        Template
-      </label>
+      <div class="row" style="margin-bottom:8px">
+        <div>
+          <label class="field-label">Template</label>
 
-      <input
-        type="text"
-        id="batch-template"
-        value="ITEM-{n}"
-        style="margin-bottom:16px"
-      >
+          <input
+            type="text"
+            id="batch-template"
+            value="ITEM-{n}"
+            spellcheck="false"
+            style="font-family:monospace"
+          >
+        </div>
+
+        <div>
+          <label class="field-label">Unique 5-digit code</label>
+
+          <select
+            id="batch-code-mode"
+            onchange="onBatchCodeModeChange()"
+          >
+            <option value="off">Off — no code</option>
+            <option value="token">In the template ({code})</option>
+            <option value="line">On its own line below the text</option>
+            <option value="both">Both — template + own line</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="hint" id="batch-code-hint" style="margin-bottom:18px"></div>
 
       <div class="row">
         <div>
@@ -1435,6 +1508,13 @@
         Nothing previewed yet
       </div>
     </div>
+
+    <!-- Unique codes assigned to the last batch run -->
+    <div
+      class="codes-box"
+      id="batch-codes-box"
+      style="display:none"
+    ></div>
   </div>
 
 </div>
@@ -2118,6 +2198,9 @@ function buildPayload(panel) {
             'batch-template'
           ).value,
 
+        code_mode:
+          batchCodeMode(),
+
         start:
           document.getElementById(
             'batch-from'
@@ -2140,6 +2223,250 @@ function buildPayload(panel) {
 }
 
 
+// ---------------------------------------------------------------------
+// Batch run: unique 5-digit codes per label
+//
+// The backend reserves the codes (and remembers them per template +
+// number), so Preview and Print always show the same codes. All this
+// code does is pick the mode, keep the hint honest, and display what the
+// server assigned.
+// ---------------------------------------------------------------------
+
+const BATCH_CODE_HINTS = {
+  off:
+    'No unique code — labels contain only the template text.',
+
+  token:
+    'Codes are generated automatically and placed where {code} appears, ' +
+    'e.g. ITEM-{n}-{code} becomes ITEM-7-42867. Re-running this batch ' +
+    'reuses the same codes, so reprints stay identical.',
+
+  line:
+    'Every label prints its template text with the 5-digit code centred ' +
+    'on a line underneath. Text batches only.',
+
+  both:
+    'The code is placed where {code} appears and also printed on its own ' +
+    'line below the text.'
+};
+
+
+function batchCodeMode() {
+  const select =
+    document.getElementById(
+      'batch-code-mode'
+    );
+
+  return select
+    ? select.value
+    : 'off';
+}
+
+
+function hasBatchCodeToken(value) {
+  return /\{\s*(code|serial|unique)\s*\}/i.test(
+    String(value || '')
+  );
+}
+
+
+function onBatchCodeModeChange() {
+  const mode =
+    batchCodeMode();
+
+  const template =
+    document.getElementById(
+      'batch-template'
+    );
+
+  // Choosing a template-token mode without a {code} placeholder would
+  // only fail later, so add the placeholder right away -- the change is
+  // visible in the template field and can be edited like any text.
+  if (
+    (mode === 'token' || mode === 'both') &&
+    template &&
+    !hasBatchCodeToken(template.value)
+  ) {
+    const value =
+      template.value.trim();
+
+    template.value =
+      value
+        ? `${value}-{code}`
+        : '{code}';
+
+    showSuccess(
+      'Added {code} to the batch template — move or edit it anywhere.'
+    );
+  }
+
+  updateBatchCodeHint();
+}
+
+
+function updateBatchCodeHint() {
+  const hint =
+    document.getElementById(
+      'batch-code-hint'
+    );
+
+  if (!hint) return;
+
+  const mode =
+    batchCodeMode();
+
+  const template =
+    document.getElementById(
+      'batch-template'
+    );
+
+  const hasToken =
+    hasBatchCodeToken(
+      template ? template.value : ''
+    );
+
+  let text =
+    BATCH_CODE_HINTS[mode] ||
+    BATCH_CODE_HINTS.off;
+
+  if (mode === 'off' && hasToken) {
+    text =
+      'Codes are off, so the {code} placeholder is left out of the ' +
+      'label. Switch the mode on to print a unique code.';
+  }
+
+  if (mode === 'token' && !hasToken) {
+    text =
+      'The template has no {code} placeholder. Add {code} where the code ' +
+      'should be printed, or choose "On its own line below the text".';
+  }
+
+  if (mode === 'both' && !hasToken) {
+    text +=
+      ' This template has no {code} placeholder, so the code prints on ' +
+      'its own line only.';
+  }
+
+  if (mode !== 'off') {
+    text +=
+      ' Codes are stored with their print counts, and the Summary panel ' +
+      'lists them like any other code.';
+  }
+
+  hint.textContent = text;
+}
+
+
+function validateBatchCodeTemplate() {
+  const template =
+    document.getElementById(
+      'batch-template'
+    );
+
+  if (
+    batchCodeMode() === 'token' &&
+    !hasBatchCodeToken(template ? template.value : '')
+  ) {
+    throw new Error(
+      'The template has no {code} placeholder. Add {code} where the ' +
+      'code should be printed, or choose "On its own line below the text".'
+    );
+  }
+}
+
+
+let lastBatchCodes = [];
+
+
+function renderBatchCodes(codes) {
+  const box =
+    document.getElementById(
+      'batch-codes-box'
+    );
+
+  if (!box) return;
+
+  lastBatchCodes =
+    Array.isArray(codes)
+      ? codes
+      : [];
+
+  if (!lastBatchCodes.length) {
+    box.style.display = 'none';
+    box.innerHTML = '';
+    return;
+  }
+
+  const shown =
+    lastBatchCodes.slice(0, 100);
+
+  box.innerHTML =
+    `<div class="codes-head">` +
+      `<span>UNIQUE CODES (${lastBatchCodes.length})</span>` +
+      `<button type="button" onclick="copyBatchCodes()">Copy</button>` +
+    `</div>` +
+    `<div class="codes-list">` +
+      shown
+        .map(
+          item =>
+            `<div class="code-row">` +
+              `<span class="code-n">#${escapeHtml(item.n)}</span>` +
+              `<span class="code-value">${escapeHtml(item.serial)}</span>` +
+            `</div>`
+        )
+        .join('') +
+      (lastBatchCodes.length > shown.length
+        ? `<div class="code-row"><span class="code-n">` +
+          `+${lastBatchCodes.length - shown.length} more…</span></div>`
+        : '') +
+    `</div>`;
+
+  box.style.display = '';
+}
+
+
+async function copyBatchCodes() {
+  const text =
+    lastBatchCodes
+      .map(item => `${item.n}\t${item.serial}`)
+      .join('\n');
+
+  if (!text) return;
+
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const area = document.createElement('textarea');
+      area.value = text;
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand('copy');
+      area.remove();
+    }
+
+    showSuccess(`Copied ${lastBatchCodes.length} code(s).`);
+
+  } catch (e) {
+    showError('Could not copy the codes: ' + e.message);
+  }
+}
+
+
+updateBatchCodeHint();
+
+// Keep the code hint honest while the template is edited by hand.
+const batchTemplateField =
+  document.getElementById('batch-template');
+
+if (batchTemplateField) {
+  batchTemplateField.addEventListener(
+    'input',
+    updateBatchCodeHint
+  );
+}
+
+
 async function preview(panel) {
   clearMessage();
 
@@ -2154,6 +2481,10 @@ async function preview(panel) {
   try {
     if (panel === 'text') {
       await ensureTextSerials();
+    }
+
+    if (panel === 'batch') {
+      validateBatchCodeTemplate();
     }
 
     let resp;
@@ -2257,6 +2588,13 @@ async function preview(panel) {
         </div>`;
     }
 
+    // Batch runs report the codes that were reserved for this run.
+    renderBatchCodes(
+      panel === 'batch'
+        ? data.batch_codes
+        : null
+    );
+
   } catch (e) {
     previewBox.innerHTML =
       '<div class="preview-empty">Nothing previewed yet</div>';
@@ -2280,6 +2618,10 @@ async function doPrint(panel) {
   try {
     if (panel === 'text') {
       await ensureTextSerials();
+    }
+
+    if (panel === 'batch') {
+      validateBatchCodeTemplate();
     }
 
     let resp;
@@ -2372,6 +2714,22 @@ async function doPrint(panel) {
     }
     if (panel === 'text') {
       msg += ' Existing codes were kept; rows without a code printed as text only.';
+    }
+    if (Array.isArray(data.batch_codes) && data.batch_codes.length) {
+      const codes =
+        data.batch_codes.map(item => item.serial);
+
+      const listed =
+        codes.slice(0, 5).join(', ');
+
+      msg +=
+        ` Unique codes: ${listed}` +
+        (codes.length > 5 ? ` … (${codes.length} in total)` : '') +
+        '. They are listed in Summary with their print counts.';
+
+      renderBatchCodes(data.batch_codes);
+    } else if (panel !== 'batch') {
+      renderBatchCodes(null);
     }
     if (data.warning) {
       msg += `\nNote: ${data.warning}`;

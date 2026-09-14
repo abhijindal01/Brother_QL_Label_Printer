@@ -191,6 +191,19 @@ def init_db():
             )
         """)
 
+        # Batch runs key their generated 5-digit codes by (template,
+        # counter) so re-running the same batch reuses the same codes
+        # instead of reserving a fresh set every single time.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS batch_serials (
+                batch_key TEXT NOT NULL,
+                n INTEGER NOT NULL,
+                serial TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (batch_key, n)
+            )
+        """)
+
 
 def get_setting(key, default=None):
     """Read one persisted setting; env/DB failures fall back to default."""
@@ -884,6 +897,33 @@ def render_multiple_texts(
     )
 
 
+def render_batch_text_with_code(
+    text,
+    serial,
+    label_size,
+    font_name,
+    font_size,
+    orientation="standard"
+):
+    """
+    Batch label in "code on its own line" mode: the template text centred
+    on the label with its 5-digit unique code centred underneath.
+    """
+    return render_text_grid(
+        [
+            {
+                "text": text,
+                "serial": serial
+            }
+        ],
+        label_size,
+        font_name,
+        font_size,
+        orientation,
+        columns=1
+    )
+
+
 def render_qr(content, label_size, orientation="standard"):
     qr = qrcode.QRCode(
         border=1,
@@ -1034,6 +1074,18 @@ def render_image_upload(
 
 # Unique codes are exactly 5 digits, e.g. "58464".
 SERIAL_RE = re.compile(r"^[0-9]{5}$")
+
+# The smallest / largest 5-digit code, used when a batch has to reserve
+# codes in bulk.
+SERIAL_MIN = 0
+SERIAL_MAX = 99999
+
+# Batch templates can drop the generated code anywhere with {code}
+# ({serial} is accepted as an alias).
+CODE_TOKEN_RE = re.compile(
+    r"\{\s*(?:code|serial|unique)\s*\}",
+    re.IGNORECASE
+)
 
 
 def normalize_serial(serial):
@@ -1233,11 +1285,351 @@ def mark_serial_printed(
         )
 
 
-def expand_template(template, n):
-    return str(template).replace(
-        "{n}",
-        str(n)
+def template_has_code_token(template):
+    """True when a batch template contains a {code} placeholder."""
+    return bool(CODE_TOKEN_RE.search(str(template or "")))
+
+
+def tidy_without_code(text):
+    """
+    Clean up the gap left behind when a {code} token is removed, so a
+    template like "ITEM-{n}-{code}" becomes "ITEM-1" and not "ITEM-1-".
+    """
+    text = re.sub(r"[ \t]{2,}", " ", str(text)).strip()
+    return text.strip("-_:;,|/\\ ").strip()
+
+
+def expand_template(template, n, code=None):
+    """
+    Fill a batch template.
+
+    Tokens:
+      {n}     -> the batch counter (1, 2, 3, ...)
+      {code}  -> the label's 5-digit unique code ({serial} works too)
+
+    When no code is supplied (code=None) the {code} token is dropped from
+    the text; that is how the "code on its own line" mode renders its
+    label text, because the code is drawn underneath it instead.
+    """
+    text = str(
+        template if template is not None else "{n}"
+    ).replace("{n}", str(n))
+
+    if template_has_code_token(text):
+        if code is None:
+            text = tidy_without_code(
+                CODE_TOKEN_RE.sub(" ", text)
+            )
+        else:
+            text = CODE_TOKEN_RE.sub(
+                str(code),
+                text
+            )
+
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Batch unique codes
+#
+# The Batch run panel can give every label its own 5-digit code, in one of
+# four modes:
+#
+#   off    - no code (unchanged behaviour)
+#   token  - {code} inside the template is replaced by the code
+#   line   - the text is printed with the code on its own line below it
+#   both   - {code} is replaced *and* the code is printed on its own line
+#
+# Codes are generated once per (template, counter) and remembered, so
+# re-running the same batch reuses the same codes, and they live in the
+# same used_serials table as manually entered codes so the Summary panel
+# and print history cover batch runs too.
+# ---------------------------------------------------------------------------
+
+BATCH_CODE_MODES = ("off", "token", "line", "both")
+
+BATCH_CODE_MODE_ALIASES = {
+    "": "off",
+    "0": "off",
+    "no": "off",
+    "none": "off",
+    "off": "off",
+    "false": "off",
+    "token": "token",
+    "code": "token",
+    "inline": "token",
+    "template": "token",
+    "own_line": "line",
+    "ownline": "line",
+    "line": "line",
+    "below": "line",
+    "below_text": "line",
+    "both": "both",
+    "all": "both",
+}
+
+
+def normalize_batch_code_mode(value):
+    """Map whatever the UI sends to one of BATCH_CODE_MODES."""
+    mode = BATCH_CODE_MODE_ALIASES.get(
+        str(value or "").strip().lower()
     )
+
+    return mode if mode in BATCH_CODE_MODES else "off"
+
+
+def batch_code_signature(kind, template):
+    """
+    Identity of a batch definition: label kind + the template *without*
+    its {code} placeholder.
+
+    Where the code is printed is a layout choice, not a different batch,
+    so "ITEM-{n}-{code}" and "ITEM-{n}" share one set of codes. That way
+    moving the code from inside the text to its own line -- or back --
+    keeps reprints identical instead of burning a fresh batch of codes.
+    """
+    without_code = CODE_TOKEN_RE.sub(
+        " ",
+        str(template or "")
+    )
+
+    normalized_template = re.sub(
+        r"\s+", " ", tidy_without_code(without_code)
+    ).strip()
+
+    return f"{str(kind or 'text').strip().lower()}|{normalized_template}"
+
+
+def load_batch_serials(signature):
+    """{batch counter: 5-digit code} already assigned to this batch."""
+    init_db()
+
+    with sqlite3.connect(SERIAL_DB) as conn:
+        rows = conn.execute(
+            """
+            SELECT n, serial
+            FROM batch_serials
+            WHERE batch_key=?
+            """,
+            (signature,)
+        ).fetchall()
+
+    return {
+        int(n): str(serial)
+        for n, serial in rows
+    }
+
+
+def save_batch_serials(signature, mapping):
+    """Remember which code belongs to which counter of a batch."""
+    if not mapping:
+        return
+
+    init_db()
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    with sqlite3.connect(SERIAL_DB) as conn:
+        conn.executemany(
+            """
+            INSERT INTO batch_serials(
+                batch_key, n, serial, created_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(batch_key, n)
+            DO UPDATE SET serial=excluded.serial
+            """,
+            [
+                (signature, int(n), str(serial), now)
+                for n, serial in mapping.items()
+            ]
+        )
+
+
+def reserve_unique_serials(count, text_for=None):
+    """
+    Reserve `count` brand-new 5-digit codes in a single transaction.
+
+    Picking the codes and inserting them under one write lock means a
+    batch run can never hand out a code twice, and never half-succeeds:
+    if the 5-digit pool is exhausted nothing is reserved at all.
+
+    `text_for(serial, index)` builds the text_content stored for each
+    code. Returns the codes in order.
+    """
+    count = int(count)
+
+    if count <= 0:
+        return []
+
+    init_db()
+
+    conn = sqlite3.connect(
+        SERIAL_DB,
+        timeout=30,
+        isolation_level=None
+    )
+
+    try:
+        # Take the write lock *before* reading, so two concurrent batch
+        # runs cannot both pick the same free codes.
+        conn.execute("BEGIN IMMEDIATE")
+
+        used = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT serial FROM used_serials"
+            )
+        }
+
+        free = [
+            index
+            for index in range(SERIAL_MIN, SERIAL_MAX + 1)
+            if f"{index:05d}" not in used
+        ]
+
+        if len(free) < count:
+            raise ValueError(
+                f"Only {len(free)} unused 5-digit codes are left, but "
+                f"this batch needs {count}. Delete some codes in the "
+                f"Summary panel and try again."
+            )
+
+        codes = [
+            f"{index:05d}"
+            for index in random.sample(free, count)
+        ]
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        rows = []
+        for index, serial in enumerate(codes):
+            text = ""
+            if text_for is not None:
+                text = str(
+                    text_for(serial, index) or ""
+                ).strip()
+            rows.append((serial, text, now))
+
+        conn.executemany(
+            """
+            INSERT INTO used_serials(
+                serial, text_content, created_at,
+                printed_at, print_count
+            )
+            VALUES (?, ?, ?, NULL, 0)
+            """,
+            rows
+        )
+
+        conn.execute("COMMIT")
+
+        return codes
+
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+    finally:
+        conn.close()
+
+
+def assign_batch_serials(kind, template, values, inline=True):
+    """
+    Give every label of a batch run its own 5-digit unique code.
+
+    Returns [{"n": n, "serial": "58464", "text": "<label text>"}, ...].
+
+    Codes are reused from earlier runs of the same batch, so reprints
+    come out identical. The remembered mapping is the authority: a code
+    is only replaced when it no longer exists (deleted from the Summary
+    history), which is also how a fresh set of codes is requested.
+    """
+    values = list(values)
+
+    if not values:
+        return []
+
+    signature = batch_code_signature(
+        kind,
+        template
+    )
+
+    remembered = load_batch_serials(signature)
+
+    entries = []
+    missing = []  # indexes of entries that still need a code
+
+    for n in values:
+        base_text = expand_template(
+            template,
+            n,
+            code=None
+        )
+
+        serial = normalize_serial(
+            remembered.get(n, "")
+        )
+
+        if not SERIAL_RE.fullmatch(serial):
+            serial = ""
+
+        # A remembered code is kept as long as it still exists. Deleting
+        # it in the Summary panel is what asks for a new one.
+        if serial and get_serial_record(serial) is None:
+            serial = ""
+
+        entries.append({
+            "n": n,
+            "serial": serial,
+            "text": base_text
+        })
+
+        if not serial:
+            missing.append(len(entries) - 1)
+
+    if missing:
+        def text_for(serial, index):
+            entry = entries[missing[index]]
+
+            if inline:
+                return expand_template(
+                    template,
+                    entry["n"],
+                    code=serial
+                )
+
+            return entry["text"]
+
+        codes = reserve_unique_serials(
+            len(missing),
+            text_for
+        )
+
+        for index, serial in zip(missing, codes):
+            entries[index]["serial"] = serial
+
+        save_batch_serials(
+            signature,
+            {
+                entries[index]["n"]: entries[index]["serial"]
+                for index in missing
+            }
+        )
+
+    # Final label text, with the code inline where it is printed there.
+    for entry in entries:
+        if inline and entry["serial"]:
+            entry["text"] = expand_template(
+                template,
+                entry["n"],
+                code=entry["serial"]
+            )
+
+    return entries
 
 
 def parse_bool(value):
@@ -1268,7 +1660,14 @@ def parse_payload_from_request():
     return request.get_json(force=True) or {}
 
 
-def build_images_for_request(payload, files=None):
+def build_images_for_request(payload, files=None, meta=None):
+    """
+    Render every label of a request.
+
+    `meta` (optional dict) is filled with the batch unique codes that
+    were assigned, so the API can echo them back and record them in the
+    print history.
+    """
     kind = payload.get("kind", "text")
     label_size = payload.get(
         "label_size",
@@ -1376,14 +1775,76 @@ def build_images_for_request(payload, files=None):
             step
         )
 
+        code_mode = normalize_batch_code_mode(
+            batch.get("code_mode", "off")
+        )
+
         # No artificial 200-label application limit.
         # Brother/printer limitations still apply to the actual print job.
-        return [
-            make_one(
-                expand_template(template, n)
+        if code_mode == "off":
+            return [
+                make_one(
+                    expand_template(template, n)
+                )
+                for n in values
+            ]
+
+        has_token = template_has_code_token(template)
+        inline = code_mode in ("token", "both")
+        own_line = code_mode in ("line", "both")
+
+        if not has_token and not own_line:
+            raise ValueError(
+                "This batch prints the unique code inside the template, "
+                "but the template has no {code} placeholder. Add {code} "
+                "where the code should be printed, or switch the code "
+                "mode to \"On its own line below the text\"."
             )
-            for n in values
-        ]
+
+        if own_line and kind != "text":
+            if not (inline and has_token):
+                raise ValueError(
+                    "A unique code on its own line only works for Text "
+                    "batches. Put {code} inside the QR/barcode content "
+                    "instead."
+                )
+
+            # The QR/barcode image carries the code itself, so there is
+            # nothing to draw underneath it.
+            own_line = False
+
+        labels = assign_batch_serials(
+            kind,
+            template,
+            values,
+            inline=inline
+        )
+
+        if meta is not None:
+            meta["batch_codes"] = labels
+
+        font_name = payload.get("font", "Default")
+        font_size = payload.get("font_size", 60)
+
+        images = []
+
+        for label in labels:
+            if own_line:
+                images.append(with_margins(
+                    render_batch_text_with_code(
+                        label["text"],
+                        label["serial"],
+                        label_size,
+                        font_name,
+                        int(font_size),
+                        orientation
+                    )
+                ))
+            else:
+                # {code} was already substituted into the label text.
+                images.append(make_one(label["text"]))
+
+        return images
 
     content = payload.get(
         "content",
@@ -2787,9 +3248,12 @@ def api_preview():
 
         files = request.files
 
+        meta = {}
+
         images = build_images_for_request(
             payload,
-            files
+            files,
+            meta
         )
 
         previews = [
@@ -2797,11 +3261,19 @@ def api_preview():
             for img in images[:5]
         ]
 
-        return jsonify({
+        response = {
             "ok": True,
             "previews": previews,
             "count": len(images)
-        })
+        }
+
+        # A batch run reserves its unique codes here, so send them back:
+        # the UI shows (and can copy) exactly what is going to be
+        # printed, and the codes stay reserved for the print call.
+        if meta.get("batch_codes"):
+            response["batch_codes"] = meta["batch_codes"]
+
+        return jsonify(response)
 
     except Exception as e:
         traceback.print_exc()
@@ -2868,18 +3340,26 @@ def api_print():
 
             # Print must NEVER generate missing codes.
             # Manual codes are preserved; an empty code stays empty.
-            prepared_entries = prepare_text_serials(
-                entries,
-                generate_missing=False
-            )
+            #
+            # A batch run of text labels has no text_entries -- its rows
+            # come from the batch template -- so only prepare the table
+            # when the request actually carried one.
+            if isinstance(entries, list) and entries:
+                prepared_entries = prepare_text_serials(
+                    entries,
+                    generate_missing=False
+                )
 
-            payload["text_entries"] = prepared_entries
+                payload["text_entries"] = prepared_entries
 
         files = request.files
 
+        meta = {}
+
         images = build_images_for_request(
             payload,
-            files
+            files,
+            meta
         )
 
         label_size = payload.get(
@@ -2892,7 +3372,22 @@ def api_print():
             label_size
         ) or {}
 
-        if payload.get("kind") == "text":
+        batch_codes = meta.get("batch_codes") or []
+
+        if batch_codes:
+            # Batch runs get their own unique codes -- record the print in
+            # the Summary history exactly like manually entered codes.
+            for item in batch_codes:
+                serial = item.get("serial")
+
+                if serial:
+                    mark_serial_printed(
+                        serial,
+                        item.get("text"),
+                        1
+                    )
+
+        elif payload.get("kind") == "text":
             copies = max(
                 1,
                 int(payload.get("copies", 1))
@@ -2923,6 +3418,8 @@ def api_print():
             "ok": True,
             "printed": len(images),
         }
+        if batch_codes:
+            response["batch_codes"] = batch_codes
         if isinstance(result, dict):
             if result.get("uri"):
                 response["printer_used"] = result["uri"]
