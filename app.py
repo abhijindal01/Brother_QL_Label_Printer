@@ -3456,7 +3456,7 @@ def api_status():
         snapshot = probe_printer()
     except Exception as e:
         traceback.print_exc()
-        return jsonify({
+        resp = jsonify({
             "ok": True,
             "app": APP_NAME,
             "version": APP_VERSION,
@@ -3467,6 +3467,8 @@ def api_status():
             "device_path": printer_device_path(),
             "detail": f"Status probe failed: {e}",
         })
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
     # Keep the historic flat keys for backwards compatibility and add
     # the full snapshot alongside.
     payload = {
@@ -3481,7 +3483,9 @@ def api_status():
     }
     payload.update(snapshot)
     payload["ok"] = True
-    return jsonify(payload)
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 
 @app.route("/api/printer/diagnostics")
