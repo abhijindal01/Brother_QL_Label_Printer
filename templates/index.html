@@ -2924,21 +2924,23 @@ async function checkStatus() {
   };
 
   try {
-    const resp = await fetch('/api/status');
+    const resp = await fetch('/api/status', { cache: 'no-store' });
     const data = await resp.json();
     lastStatusData = data;
     updatePrinterTarget(data);
 
+    // Only report "Printer ready" if the printer is actually present right now
     if (data.device_present) {
       let label = 'Printer ready';
       let extra = '';
-      if (data.last_printer_used && data.last_printer_used !== data.printer) {
-        extra = `via fallback ${data.last_printer_used}`;
-      } else if (data.primary && data.primary.bus != null) {
+      if (data.primary && data.primary.bus != null) {
         extra = `bus ${data.primary.bus} addr ${data.primary.address}`;
+      } else if (data.last_printer_used && data.last_printer_used !== data.printer) {
+        extra = `via fallback ${data.last_printer_used}`;
       }
       setState('', label, extra, JSON.stringify(data.primary || {}, null, 1));
     } else {
+      // Printer wire unplugged or printer offline: reset stale fallback label and show offline status
       const reason =
         data.detail ||
         (data.primary && data.primary.error) ||
