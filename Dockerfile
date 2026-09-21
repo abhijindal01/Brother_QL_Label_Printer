@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-ocr-b \
     libusb-1.0-0 \
     usbutils \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -24,6 +25,7 @@ RUN mkdir -p /app/data /app/templates && \
       cp /app/index.html /app/templates/index.html; \
     fi
 
+ENV PYTHONUNBUFFERED=1
 ENV PORT=8013
 ENV SERIAL_DB=/app/data/label_serials.db
 ENV PRINTER_MODEL=QL-800
@@ -39,7 +41,7 @@ ENV PRINTER_AUTO_FALLBACK=1
 ENV PRINTER_FALLBACKS=""
 EXPOSE 8013
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
   CMD python -c "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:%s/api/health' % os.environ.get('PORT','8013'))"
 
-CMD ["python", "app.py"]
+CMD ["python", "-u", "app.py"]

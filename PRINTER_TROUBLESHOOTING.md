@@ -75,20 +75,26 @@ dmesg | tail -20
    # unplug 10 s, replug, retry
    ```
 
-2. Keep the compose USB mapping and privileged mode:
+2. Keep the dynamic compose volume mapping and privileged mode:
 
    ```yaml
-   devices:
-     - "/dev/bus/usb:/dev/bus/usb"
+   volumes:
+     - ./data:/app/data
+     - /dev/bus/usb:/dev/bus/usb
+     - /dev:/dev
+     - /run/udev:/run/udev:ro
+     - /sys:/sys
    privileged: true
    ```
 
+   Mounting `/dev/bus/usb` and `/dev` as bind mounts in `volumes:` (instead of static `devices:`)
+   ensures newly assigned USB device nodes are visible dynamically when the printer wakes or reconnects.
    `privileged` is required for `detach_kernel_driver()` (needs
    `CAP_SYS_ADMIN`); the udev rule alone only fixes file permissions.
 
-3. If you use `PRINTER=file:///dev/usb/lp0`, also map that node and set
-   `PRINTER_FALLBACKS: "usb://0x04f9:0x209b"` (or vice versa) so either
-   backend can take over.
+3. If you use `PRINTER=file:///dev/usb/lp0`, it is already mapped via `/dev:/dev` and fallback
+   `PRINTER_FALLBACKS: "usb://0x04f9:0x209b"` (or vice versa) allows either
+   backend to take over dynamically.
 
 ## Wi-Fi printer checklist (QL-810W / QL-820NWB / QL-1110NWB)
 

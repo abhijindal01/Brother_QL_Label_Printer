@@ -26,13 +26,58 @@ This grants USB access and disables OS-level USB autosuspend for the QL-800
 **2. Start the app:**
 
 ```bash
-docker compose up --build -d
+docker compose up -d --build
 ```
+*(Or simply `make up` / `docker compose up -d`)*
 
 **3. Open it:** http://your-server:8013
 
 Plug in the printer, press **Reconnect** in the sidebar if needed, then
 Preview and Print.
+
+## Continuous Operation & Automatic Watchdog (No Repeated Restarts Needed!)
+
+Previously, users had to repeatedly run `docker compose up -d --build` because:
+1. Docker's static `devices:` mapping failed to pick up newly assigned USB device nodes when the printer entered power-saving / sleep mode or re-enumerated.
+2. Unclosed PyUSB device handles leaked across 15-second status polls and print jobs, exhausting libusb resources.
+3. Linux USB autosuspend powered down the USB port after 2 seconds of inactivity.
+
+**All of these are now permanently fixed:**
+- **Live Dynamic USB Passthrough:** `/dev/bus/usb`, `/dev`, and `/run/udev` are mounted via volume bind mounts so replugged, waking, or re-enumerated USB printers are visible immediately without recreating or rebuilding the container.
+- **Zero Resource Leaks:** Deterministic disposal (`usb.util.dispose_resources()`) releases all libusb handles after every probe, reset, and print.
+- **Automatic Autosuspend Disabling:** The container automatically writes `on` to `/sys/bus/usb/devices/*/power/control` for Brother devices directly.
+- **Thread Safety & Status Cache:** Probing synchronizes with active prints and uses a 3-second cache so polling never collides with print jobs.
+
+### Automatic Watchdog Commands
+
+If you still want an automated loop or auto-healing watchdog to ensure the container stays up 24/7 without ever typing `compose up` manually:
+
+**Option A — Smart Watchdog Script (Recommended):**
+Monitors `/api/health` and automatically triggers `compose up -d` only if the container ever hangs:
+```bash
+./watchdog.sh
+# or via make:
+make watchdog
+```
+
+**Option B — Automatic Compose Loop (Every few seconds):**
+If you want a command that runs `compose up` automatically every few seconds:
+```bash
+# Run compose up every 30 seconds:
+make loop
+
+# Or using watchdog.sh with customizable interval:
+./watchdog.sh --periodic 30
+
+# Or a direct shell one-liner:
+while true; do docker compose up -d; sleep 30; done
+```
+
+**Option C — Built-in Autoheal Container:**
+`docker-compose.yml` now includes the `autoheal` service enabled by default. Docker will automatically restart `label-bench` if the container healthcheck ever fails.
+
+**Option D — Windows Users:**
+Double-click or run `watchdog.bat` to keep the container monitored in Windows/Docker Desktop.
 
 ## Wi-Fi printers (QL-810W / QL-820NWB)
 
