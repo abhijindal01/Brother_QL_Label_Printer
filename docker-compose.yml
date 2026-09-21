@@ -32,24 +32,42 @@ services:
       # Extra fallback URIs (comma-separated), e.g. "file:///dev/usb/lp0".
       PRINTER_FALLBACKS: ""
 
-    # Give the container direct access to the USB bus.
-    # Required for Brother-QL usb:// printing.
-    devices:
-      - "/dev/bus/usb:/dev/bus/usb"
-      # Optional: if your host exposes the printer as /dev/usb/lp0 and you
-      # want the linux_kernel fallback backend (file:///dev/usb/lp0), add:
-      #   - "/dev/usb/lp0:/dev/usb/lp0"
-      # Only add it when the node exists on the host -- Docker refuses to
-      # start the container if a mapped device path is missing.
-
+    # Dynamic USB and device passthrough via volume bind mounts:
+    # 1. /dev/bus/usb: Live bind mount ensures that when the printer sleeps,
+    #    autosuspends, or is re-plugged, the new minor device node on the host
+    #    is IMMEDIATELY visible inside the container without container recreation.
+    # 2. /dev: Dynamically maps newly created /dev/usb/lp* nodes when the kernel
+    #    usblp driver claims the printer.
+    # 3. /run/udev: Live udev database access for libusb device enumeration.
+    # 4. /sys: Allows the container to disable OS USB autosuspend automatically.
     volumes:
       - ./data:/app/data
+      - /dev/bus/usb:/dev/bus/usb
+      - /dev:/dev
+      - /run/udev:/run/udev:ro
+      - /sys:/sys
 
     # Required: brother_ql calls detach_kernel_driver() to pry the
     # interface away from the Linux usblp kernel driver. That needs
-    # CAP_SYS_ADMIN, which only privileged mode grants -- the udev
-    # rule + device mapping alone only cover file permissions on the
-    # /dev node, not this kernel capability.
+    # CAP_SYS_ADMIN, which privileged mode grants.
     privileged: true
 
     restart: unless-stopped
+
+    labels:
+      - "autoheal=true"
+
+  # Auto-heal service: monitors container health checks and automatically
+  # restarts the service if it ever hangs or becomes unresponsive,
+  # eliminating the need for manual restarts or rebuilds.
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: label-bench-autoheal
+    restart: unless-stopped
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=10
+      - AUTOHEAL_START_PERIOD=30
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    network_mode: none

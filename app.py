@@ -21,12 +21,125 @@ from barcode.writer import ImageWriter
 import time
 import usb.core
 import usb.util
+import brother_ql.backends.pyusb as brother_pyusb
 
 from brother_ql.raster import BrotherQLRaster
 from brother_ql.conversion import convert
 from brother_ql.backends.helpers import send as ql_send, guess_backend
 from brother_ql.backends import backend_factory
 from brother_ql.reader import interpret_response
+
+# --- Safe PyUSB Resource Management Patches ---
+# brother_ql's default pyusb backend has two critical resource leak issues:
+# 1. In _dispose(), it calls usb.util.dispose_resources(self.dev) and THEN
+#    calls self.dev.attach_kernel_driver(0). attach_kernel_driver re-opens
+#    a libusb handle that is NEVER disposed, leaking 1 handle per print job!
+# 2. In list_available_devices(), usb.util.get_string() opens handles for all
+#    visible Brother USB printers. Any device NOT chosen as self.dev is left
+#    with an open handle.
+# Over time, these leaked handles exhaust OS file descriptors and cause libusb
+# to fail with "Device not found" or "Resource busy", forcing container restarts.
+_orig_pyusb_dispose = brother_pyusb.BrotherQLBackendPyUSB._dispose
+
+
+def _safe_pyusb_dispose(self):
+    if getattr(self, "was_kernel_driver_active", False) and getattr(self, "dev", None):
+        try:
+            self.dev.attach_kernel_driver(0)
+        except Exception:
+            pass
+    if getattr(self, "dev", None):
+        try:
+            usb.util.dispose_resources(self.dev)
+        except Exception:
+            pass
+    for attr in ("write_dev", "read_dev", "dev"):
+        if hasattr(self, attr):
+            try:
+                delattr(self, attr)
+            except Exception:
+                pass
+
+
+brother_pyusb.BrotherQLBackendPyUSB._dispose = _safe_pyusb_dispose
+
+_orig_pyusb_init = brother_pyusb.BrotherQLBackendPyUSB.__init__
+
+
+def _safe_pyusb_init(self, device_specifier):
+    devs_scanned = []
+    _orig_list = brother_pyusb.list_available_devices
+
+    def _tracking_list():
+        res = _orig_list()
+        for item in res:
+            if isinstance(item, dict) and "instance" in item:
+                devs_scanned.append(item["instance"])
+        return res
+
+    brother_pyusb.list_available_devices = _tracking_list
+    try:
+        _orig_pyusb_init(self, device_specifier)
+    finally:
+        brother_pyusb.list_available_devices = _orig_list
+        for d in devs_scanned:
+            if d is not getattr(self, "dev", None):
+                try:
+                    usb.util.dispose_resources(d)
+                except Exception:
+                    pass
+
+
+brother_pyusb.BrotherQLBackendPyUSB.__init__ = _safe_pyusb_init
+
+
+def disable_linux_usb_autosuspend():
+    """Disable OS-level USB autosuspend for all Brother USB devices in /sys.
+
+    Linux USB autosuspend defaults to 'auto' for idle devices, putting the
+    QL-800 into low-power sleep after 2 seconds. In a privileged container,
+    writing 'on' directly to /sys/bus/usb/devices/*/power/control keeps the
+    printer awake without requiring manual host udev rule installation.
+    """
+    try:
+        sys_usb = "/sys/bus/usb/devices"
+        if not os.path.isdir(sys_usb):
+            return
+        for entry in os.listdir(sys_usb):
+            dev_path = os.path.join(sys_usb, entry)
+            vendor_file = os.path.join(dev_path, "idVendor")
+            if os.path.isfile(vendor_file):
+                try:
+                    with open(vendor_file, "r") as f:
+                        vid = f.read().strip().lower()
+                    if vid == "04f9":  # Brother Industries
+                        control_file = os.path.join(dev_path, "power", "control")
+                        if os.path.isfile(control_file):
+                            with open(control_file, "r+") as f:
+                                current = f.read().strip()
+                                if current != "on":
+                                    f.seek(0)
+                                    f.write("on")
+                                    f.truncate()
+                                    logger.info(
+                                        "Disabled USB autosuspend for Brother device at %s",
+                                        dev_path,
+                                    )
+                        autosuspend_file = os.path.join(
+                            dev_path, "power", "autosuspend"
+                        )
+                        if os.path.isfile(autosuspend_file):
+                            try:
+                                with open(autosuspend_file, "w") as f:
+                                    f.write("-1")
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.debug(
+                        "Could not update power/control for %s: %s", dev_path, e
+                    )
+    except Exception as e:
+        logger.debug("disable_linux_usb_autosuspend error: %s", e)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,7 +201,14 @@ PRINTER_DISPLAY_NAME = os.environ.get(
 PRINTER = os.environ.get("PRINTER", "usb://0x04f9:0x209b")
 
 DEFAULT_LABEL_SIZE = os.environ.get("DEFAULT_LABEL_SIZE", "62")
-SERIAL_DB = os.environ.get("SERIAL_DB", "/app/data/label_serials.db")
+SERIAL_DB = os.environ.get(
+    "SERIAL_DB",
+    "/app/data/label_serials.db"
+    if os.path.isdir("/app")
+    else os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "data", "label_serials.db"
+    ),
+)
 
 # Brother QL models the app can drive. The QL-800 itself is USB-only;
 # the W/NW models add Wi-Fi (and print via tcp://HOST:9100).
@@ -154,55 +274,67 @@ FONT_DIR_CANDIDATES = [
 ]
 FALLBACK_FONT = ImageFont.load_default()
 
+_DB_INITIALIZED = False
+_DB_LOCK = threading.Lock()
+
 
 def init_db():
-    directory = os.path.dirname(SERIAL_DB)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
+    with _DB_LOCK:
+        if _DB_INITIALIZED:
+            return
+        directory = os.path.dirname(SERIAL_DB)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
 
-    with sqlite3.connect(SERIAL_DB) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS used_serials (
-                serial TEXT PRIMARY KEY,
-                text_content TEXT,
-                created_at TEXT NOT NULL,
-                printed_at TEXT,
-                print_count INTEGER NOT NULL DEFAULT 0
-            )
-        """)
+        with sqlite3.connect(SERIAL_DB) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS used_serials (
+                    serial TEXT PRIMARY KEY,
+                    text_content TEXT,
+                    created_at TEXT NOT NULL,
+                    printed_at TEXT,
+                    print_count INTEGER NOT NULL DEFAULT 0
+                )
+            """)
 
-        columns = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(used_serials)")
-        }
+            columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(used_serials)")
+            }
 
-        if "text_content" not in columns:
-            conn.execute(
-                "ALTER TABLE used_serials ADD COLUMN text_content TEXT"
-            )
+            if "text_content" not in columns:
+                conn.execute(
+                    "ALTER TABLE used_serials ADD COLUMN text_content TEXT"
+                )
 
-        # Key/value store for UI-configurable settings. The printer
-        # connection (URI / model / display name) chosen in the Printer
-        # panel is persisted here and overrides the env-var defaults.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS app_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        """)
+            # Key/value store for UI-configurable settings. The printer
+            # connection (URI / model / display name) chosen in the Printer
+            # panel is persisted here and overrides the env-var defaults.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
 
-        # Batch runs key their generated 5-digit codes by (template,
-        # counter) so re-running the same batch reuses the same codes
-        # instead of reserving a fresh set every single time.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS batch_serials (
-                batch_key TEXT NOT NULL,
-                n INTEGER NOT NULL,
-                serial TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (batch_key, n)
-            )
-        """)
+            # Batch runs key their generated 5-digit codes by (template,
+            # counter) so re-running the same batch reuses the same codes
+            # instead of reserving a fresh set every single time.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS batch_serials (
+                    batch_key TEXT NOT NULL,
+                    n INTEGER NOT NULL,
+                    serial TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (batch_key, n)
+                )
+            """)
+        _DB_INITIALIZED = True
 
 
 def get_setting(key, default=None):
@@ -2114,7 +2246,7 @@ def list_brother_usb_devices():
     """
     devices = []
     try:
-        found = usb.core.find(find_all=True, idVendor=0x04F9) or []
+        found = list(usb.core.find(find_all=True, idVendor=0x04F9) or [])
     except usb.core.NoBackendError as e:
         return [], f"No USB backend: {e}"
     except Exception as e:
@@ -2158,6 +2290,12 @@ def list_brother_usb_devices():
                 "Descriptor read failed (device may be resuming from "
                 f"sleep/autosuspend): {e}"
             )
+        finally:
+            # Deterministically release the libusb handle so it never leaks
+            try:
+                usb.util.dispose_resources(dev)
+            except Exception:
+                pass
         devices.append(entry)
     return devices, None
 
@@ -2212,22 +2350,29 @@ def probe_usb_uri(uri):
             "pid": f"0x{pid:04x}",
             "error": "Device not found on the USB bus.",
         }
-    info = {
-        "present": True,
-        "uri": uri,
-        "vid": f"0x{vid:04x}",
-        "pid": f"0x{pid:04x}",
-        "bus": getattr(dev, "bus", None),
-        "address": getattr(dev, "address", None),
-    }
     try:
-        if getattr(dev, "iSerialNumber", 0):
-            info["serial"] = usb.util.get_string(
-                dev, 256, dev.iSerialNumber
-            )
-    except Exception:
-        pass
-    return info
+        info = {
+            "present": True,
+            "uri": uri,
+            "vid": f"0x{vid:04x}",
+            "pid": f"0x{pid:04x}",
+            "bus": getattr(dev, "bus", None),
+            "address": getattr(dev, "address", None),
+        }
+        try:
+            if getattr(dev, "iSerialNumber", 0):
+                info["serial"] = usb.util.get_string(
+                    dev, 256, dev.iSerialNumber
+                )
+        except Exception:
+            pass
+        return info
+    finally:
+        # Deterministically release the libusb handle so it never leaks
+        try:
+            usb.util.dispose_resources(dev)
+        except Exception:
+            pass
 
 
 def probe_printer_uri(uri):
@@ -2267,53 +2412,125 @@ def probe_printer_uri(uri):
     }
 
 
-def probe_printer():
-    """Full printer health snapshot for /api/status and diagnostics."""
-    printer_uri = active_printer_uri()
-    backend_ok, backend_error = usb_backend_available()
-    usb_devices, usb_scan_error = list_brother_usb_devices()
-    kernel_devices = list_linux_kernel_devices()
-    primary = probe_printer_uri(printer_uri)
+_PROBE_CACHE = {
+    "data": None,
+    "timestamp": 0.0,
+}
 
-    present = bool(primary.get("present"))
-    detail = primary.get("error") or primary.get("note")
 
-    if not present and PRINTER_AUTO_FALLBACK:
-        # A fallback that IS present is worth surfacing: printing may
-        # still succeed via the alternate backend.
-        for candidate in resolve_printer_candidates()[1:]:
-            alt = probe_printer_uri(candidate)
-            if alt.get("present"):
-                detail = (
-                    (detail + " " if detail else "")
-                    + f"Primary {printer_uri} is not visible, but fallback "
-                    f"{candidate} is present and will be tried."
-                )
-                break
+def _clear_probe_cache():
+    _PROBE_CACHE["data"] = None
+    _PROBE_CACHE["timestamp"] = 0.0
 
-    return {
-        "app": APP_NAME,
-        "version": APP_VERSION,
-        "model": active_model(),
-        "printer_display_name": active_display_name(),
-        "printer": printer_uri,
-        "connection": connection_type_of(printer_uri),
-        "device_present": present,
-        "device_path": printer_device_path(),
-        "primary": primary,
-        "detail": detail,
-        "usb_backend_available": backend_ok,
-        "usb_backend_error": backend_error,
-        "usb_scan_error": usb_scan_error,
-        "usb_devices": usb_devices,
-        "kernel_devices": kernel_devices,
-        "fallbacks": resolve_printer_candidates(),
-        "last_error": _PRINTER_STATE["last_error"],
-        "last_error_at": _PRINTER_STATE["last_error_at"],
-        "last_success_at": _PRINTER_STATE["last_success_at"],
-        "consecutive_failures": _PRINTER_STATE["consecutive_failures"],
-        "last_printer_used": _PRINTER_STATE["last_printer_used"],
-    }
+
+def probe_printer(force=False):
+    """Full printer health snapshot for /api/status and diagnostics.
+
+    Thread-safe and cached with short TTL (3s) to prevent USB bus churn and
+    collisions with active print jobs.
+    """
+    now = time.time()
+    if not force and (_PROBE_CACHE["data"] is not None) and (now - _PROBE_CACHE["timestamp"] < 3.0):
+        return _PROBE_CACHE["data"]
+
+    # If another thread is actively printing, do NOT touch the USB bus!
+    # Touching the USB bus while raster data is being streamed or read back
+    # triggers libusb collision ("Resource busy" / endpoint errors).
+    if _PRINT_LOCK.locked():
+        if _PROBE_CACHE["data"] is not None:
+            cached = dict(_PROBE_CACHE["data"])
+            cached["detail"] = "Print job in progress..."
+            return cached
+        return {
+            "app": APP_NAME,
+            "version": APP_VERSION,
+            "model": active_model(),
+            "printer_display_name": active_display_name(),
+            "printer": active_printer_uri(),
+            "connection": connection_type_of(active_printer_uri()),
+            "device_present": True,
+            "device_path": printer_device_path(),
+            "detail": "Print job in progress...",
+            "last_error": _PRINTER_STATE["last_error"],
+            "last_error_at": _PRINTER_STATE["last_error_at"],
+            "last_success_at": _PRINTER_STATE["last_success_at"],
+            "consecutive_failures": _PRINTER_STATE["consecutive_failures"],
+            "last_printer_used": _PRINTER_STATE["last_printer_used"],
+        }
+
+    acquired = _PRINT_LOCK.acquire(timeout=2.0)
+    if not acquired:
+        if _PROBE_CACHE["data"] is not None:
+            return _PROBE_CACHE["data"]
+        return {
+            "app": APP_NAME,
+            "version": APP_VERSION,
+            "model": active_model(),
+            "printer_display_name": active_display_name(),
+            "printer": active_printer_uri(),
+            "connection": connection_type_of(active_printer_uri()),
+            "device_present": False,
+            "device_path": printer_device_path(),
+            "detail": "Printer is currently busy",
+            "last_error": _PRINTER_STATE["last_error"],
+            "last_error_at": _PRINTER_STATE["last_error_at"],
+            "last_success_at": _PRINTER_STATE["last_success_at"],
+            "consecutive_failures": _PRINTER_STATE["consecutive_failures"],
+            "last_printer_used": _PRINTER_STATE["last_printer_used"],
+        }
+
+    try:
+        disable_linux_usb_autosuspend()
+        printer_uri = active_printer_uri()
+        backend_ok, backend_error = usb_backend_available()
+        usb_devices, usb_scan_error = list_brother_usb_devices()
+        kernel_devices = list_linux_kernel_devices()
+        primary = probe_printer_uri(printer_uri)
+
+        present = bool(primary.get("present"))
+        detail = primary.get("error") or primary.get("note")
+
+        if not present and PRINTER_AUTO_FALLBACK:
+            # A fallback that IS present is worth surfacing: printing may
+            # still succeed via the alternate backend.
+            for candidate in resolve_printer_candidates()[1:]:
+                alt = probe_printer_uri(candidate)
+                if alt.get("present"):
+                    detail = (
+                        (detail + " " if detail else "")
+                        + f"Primary {printer_uri} is not visible, but fallback "
+                        f"{candidate} is present and will be tried."
+                    )
+                    break
+
+        snapshot = {
+            "app": APP_NAME,
+            "version": APP_VERSION,
+            "model": active_model(),
+            "printer_display_name": active_display_name(),
+            "printer": printer_uri,
+            "connection": connection_type_of(printer_uri),
+            "device_present": present,
+            "device_path": printer_device_path(),
+            "primary": primary,
+            "detail": detail,
+            "usb_backend_available": backend_ok,
+            "usb_backend_error": backend_error,
+            "usb_scan_error": usb_scan_error,
+            "usb_devices": usb_devices,
+            "kernel_devices": kernel_devices,
+            "fallbacks": resolve_printer_candidates(),
+            "last_error": _PRINTER_STATE["last_error"],
+            "last_error_at": _PRINTER_STATE["last_error_at"],
+            "last_success_at": _PRINTER_STATE["last_success_at"],
+            "consecutive_failures": _PRINTER_STATE["consecutive_failures"],
+            "last_printer_used": _PRINTER_STATE["last_printer_used"],
+        }
+        _PROBE_CACHE["data"] = snapshot
+        _PROBE_CACHE["timestamp"] = time.time()
+        return snapshot
+    finally:
+        _PRINT_LOCK.release()
 
 
 def printer_device_present():
@@ -2527,9 +2744,11 @@ def _wake_probe(printer_uri):
     gives the QL-800 firmware time to answer the real open. Never raises.
     """
     try:
+        disable_linux_usb_autosuspend()
         parsed = parse_usb_uri(printer_uri)
         if parsed is not None:
             vid, pid, _serial = parsed
+            dev = None
             try:
                 dev = usb.core.find(idVendor=vid, idProduct=pid)
             except Exception:
@@ -2542,6 +2761,11 @@ def _wake_probe(printer_uri):
                         usb.util.get_string(dev, 256, dev.iProduct)
                 except Exception:
                     pass
+                finally:
+                    try:
+                        usb.util.dispose_resources(dev)
+                    except Exception:
+                        pass
                 if PRINT_WAKE_WAIT:
                     time.sleep(PRINT_WAKE_WAIT)
                 return True
@@ -2656,53 +2880,78 @@ def try_usb_reset(printer_uri=None):
             "USB reset only applies to USB printers. For a Wi-Fi "
             "printer, power-cycle it or use Reconnect instead."
         )
-    parsed = parse_usb_uri(uri)
-    if parsed is None:
-        # Try every visible Brother device as a fallback.
-        devices, scan_error = list_brother_usb_devices()
-        if scan_error:
-            return False, scan_error
-        if not devices:
-            return False, "No Brother USB devices visible to reset."
-        # Reset the first visible one via a fresh find.
-        try:
-            found = usb.core.find(find_all=True, idVendor=0x04F9) or []
-        except Exception as e:
-            return False, f"USB reset scan failed: {e}"
-        target = None
-        for dev in found:
-            target = dev
-            break
-        if target is None:
-            return False, "No Brother USB devices visible to reset."
-        try:
-            target.reset()
+
+    acquired = _PRINT_LOCK.acquire(timeout=10.0)
+    if not acquired:
+        return False, "Another print job or USB operation is in progress; retry shortly."
+    try:
+        parsed = parse_usb_uri(uri)
+        if parsed is None:
+            # Try every visible Brother device as a fallback.
+            devices, scan_error = list_brother_usb_devices()
+            if scan_error:
+                return False, scan_error
+            if not devices:
+                return False, "No Brother USB devices visible to reset."
+            # Reset the first visible one via a fresh find.
+            found = []
+            try:
+                found = list(usb.core.find(find_all=True, idVendor=0x04F9) or [])
+            except Exception as e:
+                return False, f"USB reset scan failed: {e}"
+            target = None
+            for dev in found:
+                target = dev
+                break
+            if target is None:
+                return False, "No Brother USB devices visible to reset."
+            try:
+                try:
+                    target.reset()
+                except Exception as e:
+                    return False, f"USB reset failed: {e}"
+            finally:
+                for dev in found:
+                    try:
+                        usb.util.dispose_resources(dev)
+                    except Exception:
+                        pass
             time.sleep(2.0)
+            _clear_probe_cache()
+            disable_linux_usb_autosuspend()
             return True, "USB device reset issued; retry printing."
+
+        vid, pid, _serial = parsed
+        try:
+            dev = usb.core.find(idVendor=vid, idProduct=pid)
         except Exception as e:
-            return False, f"USB reset failed: {e}"
-    vid, pid, _serial = parsed
-    try:
-        dev = usb.core.find(idVendor=vid, idProduct=pid)
-    except Exception as e:
-        return False, f"USB lookup failed: {e}"
-    if dev is None:
-        return False, (
-            f"Device 0x{vid:04x}:0x{pid:04x} not on the bus; "
-            "check cable/power."
-        )
-    try:
-        dev.reset()
-    except Exception as e:
-        text = str(e).lower()
-        if "permission" in text or "access" in text:
+            return False, f"USB lookup failed: {e}"
+        if dev is None:
             return False, (
-                f"USB reset needs more privilege: {e}. The container "
-                "normally requires privileged: true for reset."
+                f"Device 0x{vid:04x}:0x{pid:04x} not on the bus; "
+                "check cable/power."
             )
-        return False, f"USB reset failed: {e}"
-    time.sleep(2.0)
-    return True, "USB device reset issued; retry printing."
+        try:
+            dev.reset()
+        except Exception as e:
+            text = str(e).lower()
+            if "permission" in text or "access" in text:
+                return False, (
+                    f"USB reset needs more privilege: {e}. The container "
+                    "normally requires privileged: true for reset."
+                )
+            return False, f"USB reset failed: {e}"
+        finally:
+            try:
+                usb.util.dispose_resources(dev)
+            except Exception:
+                pass
+        time.sleep(2.0)
+        _clear_probe_cache()
+        disable_linux_usb_autosuspend()
+        return True, "USB device reset issued; retry printing."
+    finally:
+        _PRINT_LOCK.release()
 
 
 def print_images(images, label_size):
@@ -2721,6 +2970,7 @@ def print_images(images, label_size):
     try:
         return _print_images_locked(images, label_size)
     finally:
+        _clear_probe_cache()
         _PRINT_LOCK.release()
 
 
@@ -3492,7 +3742,7 @@ def api_status():
 def api_printer_diagnostics():
     """Live USB/kernel visibility + config, for troubleshooting."""
     try:
-        snapshot = probe_printer()
+        snapshot = probe_printer(force=True)
         effective = get_printer_config()
         snapshot["config"] = {
             "model": effective["model"],
@@ -3531,7 +3781,7 @@ def api_printer_reconnect():
             )
             messages.append(message)
             if not ok:
-                snapshot = probe_printer()
+                snapshot = probe_printer(force=True)
                 snapshot["ok"] = False
                 snapshot["error"] = message
                 snapshot["messages"] = messages
@@ -3540,7 +3790,7 @@ def api_printer_reconnect():
             time.sleep(1.0)
         else:
             _wake_probe(payload.get("printer") or active_printer_uri())
-        snapshot = probe_printer()
+        snapshot = probe_printer(force=True)
         snapshot["ok"] = True
         snapshot["messages"] = messages
         return jsonify(snapshot)
@@ -3646,6 +3896,7 @@ def api_printer_config_save():
                 "use a QL-810W / QL-820NWB / QL-1110NWB."
             )
 
+        _clear_probe_cache()
         config = get_printer_config()
         probe = probe_printer_uri(config["uri"])
         config["probe"] = probe
@@ -3670,6 +3921,7 @@ def api_printer_config_reset():
         delete_setting("printer_uri")
         delete_setting("printer_model")
         delete_setting("printer_display_name")
+        _clear_probe_cache()
         config = get_printer_config()
         config["probe"] = probe_printer_uri(config["uri"])
         config["ok"] = True
@@ -3705,8 +3957,25 @@ def api_printer_test():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+def _start_usb_watchdog_thread():
+    """Periodic background thread to maintain USB health and disable autosuspend."""
+    def _worker():
+        time.sleep(5)
+        while True:
+            try:
+                disable_linux_usb_autosuspend()
+            except Exception:
+                pass
+            time.sleep(30)
+
+    t = threading.Thread(target=_worker, daemon=True, name="usb-watchdog")
+    t.start()
+
+
 if __name__ == "__main__":
     init_db()
+    disable_linux_usb_autosuspend()
+    _start_usb_watchdog_thread()
 
     port = int(
         os.environ.get(
