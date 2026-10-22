@@ -128,6 +128,8 @@ to a different QL-series printer.
 | `PRINT_RETRY_DELAY` | `2.5` | Base retry delay (s, progressive backoff) |
 | `PRINT_WAKE_WAIT` | `1.5` | Settle wait after waking a sleeping device |
 | `PRINT_STATUS_TIMEOUT` | `10` | Seconds to wait for completion status |
+| `BATCH_CHUNK_SIZE` | `10` | Labels per printer transfer; large batches are sent in chunks |
+| `NETWORK_PRINT_TIMEOUT` | `180` | Socket timeout for `tcp://` raster transfers (seconds) |
 | `PRINTER_FALLBACKS` | _(empty)_ | Extra URIs to try, e.g. `file:///dev/usb/lp0` |
 | `PRINTER_AUTO_FALLBACK` | `1` | Auto-try discovered Brother USB / `/dev/usb/lp*` devices |
 
@@ -165,6 +167,23 @@ Notes:
 - A batch that wants an inline code but has no `{code}` in its template is
   rejected instead of silently printing uncoded labels.
 
+### Large batches are sent in chunks
+
+A batch is **not** sent as one huge transfer. One giant job can overrun the
+QL-800's input buffer or the host socket timeout, which shows up as *"the
+first 15 labels print and then the job errors out"*. Every
+`BATCH_CHUNK_SIZE` labels (default **10**) are sent as their own job:
+
+- the UI shows live progress (`18 of 30 label(s) sent, chunk 2/3`) while
+  the batch is being sent;
+- a retry only re-sends the chunk in flight, not the labels already out;
+- if the printer stops part way, the error says exactly how many labels
+  were sent and how many were not — and the codes of the labels that did
+  print are already recorded in **Summary**.
+
+Raise `BATCH_CHUNK_SIZE` if you want fewer, larger transfers (faster on a
+healthy USB link); lower it if long batches still stall.
+
 ## API overview
 
 | Endpoint | Description |
@@ -178,6 +197,7 @@ Notes:
 | `POST /api/printer/test` | Probe a URI without saving it |
 | `POST /api/preview` | Render previews (never touches the printer); batch runs return their assigned `batch_codes` |
 | `POST /api/print` | Print labels; batch runs return and record their `batch_codes` |
+| `GET /api/print/progress` | Labels sent / chunks done for the job in flight |
 | `POST /api/serial/*` | Unique-code generate / check / register |
 | `GET /api/summary` | Print history |
 

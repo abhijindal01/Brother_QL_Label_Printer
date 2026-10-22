@@ -111,6 +111,35 @@ dmesg | tail -20
 - Unlike USB, Wi-Fi printing has **no status read-back**: "sent" counts as
   success. If labels don't come out, check the roll/cover and the IP.
 
+## "Only the first N labels of a batch print, then it errors"
+
+This is a **transfer-size** problem, not a code-generation problem. A long
+batch used to be pushed to the printer as one big raster job; the QL-800's
+input buffer (and, for `tcp://` printers, the host socket timeout) can only
+absorb so much, so the first labels print and the rest of the job never
+arrives.
+
+The app now sends a batch in chunks of `BATCH_CHUNK_SIZE` labels (default
+**10**), each as its own job:
+
+- the UI shows `Sending to printer… 18 of 30 label(s) sent (chunk 2/3)`;
+- a failure message states exactly how many labels were sent and how many
+  were not, so you only reprint the missing ones;
+- codes belonging to labels that did print are already in **Summary**
+  with their print counts.
+
+If it still stops early:
+
+1. Lower `BATCH_CHUNK_SIZE` (e.g. `3`) and retry.
+2. For Wi-Fi printers (`tcp://`), raise `NETWORK_PRINT_TIMEOUT` (default
+   `180` s) — a slow print server plus a large chunk can still exceed it.
+   Check the printer is not running low on label roll mid-batch.
+3. For USB, check `dmesg` for `error -71` / `device descriptor read`
+   right after the stop; that is cable/power/hub, so try a powered hub or
+   a shorter cable.
+
+Print progress is also available as JSON at `GET /api/print/progress`.
+
 ## Error message guide
 
 | Message fragment | Meaning | Action |
