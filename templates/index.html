@@ -2614,6 +2614,7 @@ async function doPrint(panel) {
   clearMessage();
   printInFlight = true;
   showPrintingState(true, panel);
+  startProgressPolling();
 
   try {
     if (panel === 'text') {
@@ -2701,14 +2702,26 @@ async function doPrint(panel) {
     }
 
     if (!resp.ok || !data.ok) {
-      throw new Error(
-        data.error ||
-        'Print failed.'
-      );
+      const failure =
+        new Error(
+          data.error ||
+          'Print failed.'
+        );
+
+      // A chunked job can stop half way: the server tells us exactly
+      // how many labels were accepted so the message is actionable.
+      failure.partial = !!data.partial;
+      failure.printed = data.printed;
+      failure.total = data.total;
+
+      throw failure;
     }
 
     let msg =
       `Printed ${data.printed} label(s).`;
+    if (data.chunks > 1) {
+      msg += ` Sent in ${data.chunks} chunks so the printer never has to buffer the whole batch.`;
+    }
     if (data.printer_used) {
       msg += ` Via ${data.printer_used}.`;
     }
@@ -2742,13 +2755,55 @@ async function doPrint(panel) {
   } catch (e) {
     showError(
       e.message
-      + '\n\nTip: use Diagnose / Reconnect in the sidebar, or open '
-      + '/api/printer/diagnostics for the live device list.'
+      + (e.partial
+        ? '\n\nOnly the missing labels need to be sent again.'
+        : '\n\nTip: use Diagnose / Reconnect in the sidebar, or open '
+          + '/api/printer/diagnostics for the live device list.')
     );
     checkStatus();
   } finally {
+    stopProgressPolling();
     printInFlight = false;
     showPrintingState(false, panel);
+  }
+}
+
+
+let progressPollTimer = null;
+
+function startProgressPolling() {
+  stopProgressPolling();
+
+  progressPollTimer = setInterval(async () => {
+    try {
+      const resp = await fetch('/api/print/progress', { cache: 'no-store' });
+      const data = await resp.json();
+
+      if (!data || !data.active) return;
+
+      const total = data.total || 0;
+      const sent = Math.min(data.sent || 0, total);
+      const chunkInfo =
+        data.chunks_total > 1
+          ? ` (chunk ${Math.min((data.chunks_done || 0) + 1, data.chunks_total)}/${data.chunks_total})`
+          : '';
+
+      showWarning(
+        total > 1
+          ? `Sending to printer… ${sent} of ${total} label(s) sent${chunkInfo}.`
+          : 'Sending to printer… (waking / retrying automatically if needed)'
+      );
+    } catch (_) {
+      // Progress is cosmetic; never surface polling errors.
+    }
+  }, 1200);
+}
+
+
+function stopProgressPolling() {
+  if (progressPollTimer) {
+    clearInterval(progressPollTimer);
+    progressPollTimer = null;
   }
 }
 

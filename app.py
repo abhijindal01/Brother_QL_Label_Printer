@@ -170,6 +170,18 @@ PRINT_WAKE_WAIT = max(0.0, _env_float("PRINT_WAKE_WAIT", 1.5))  # seconds
 # How long to wait for the printer's "Printing completed" + "Waiting to
 # receive" status replies before treating the job as uncertain.
 PRINT_STATUS_TIMEOUT = max(2.0, _env_float("PRINT_STATUS_TIMEOUT", 10.0))
+# A single transfer carrying a whole batch can overrun the QL-800's input
+# buffer / the host's socket timeout: the first N labels come out and the
+# rest of the job dies ("printed 15, then an error"). Batch jobs are
+# therefore cut into chunks of this many labels, so every USB/TCP transfer
+# stays small and a hiccup only affects the chunk in flight.
+BATCH_CHUNK_SIZE = max(1, _env_int("BATCH_CHUNK_SIZE", 10))
+# Timeout for the blocking socket used by the network (tcp://) backend.
+# It must be generous: this bounds the *whole* raster transfer, not just
+# the connect, and 15 s was cutting long Wi-Fi jobs off mid-batch.
+NETWORK_PRINT_TIMEOUT = max(
+    15.0, _env_float("NETWORK_PRINT_TIMEOUT", 180.0)
+)
 # Optional comma-separated fallback printer URIs, tried after the primary
 # PRINTER URI has exhausted its retries.
 PRINTER_FALLBACKS = [
@@ -243,6 +255,66 @@ _PRINTER_STATE = {
     "consecutive_failures": 0,
     "last_printer_used": None,
 }
+
+# Live progress of the print job currently being sent, polled by the UI
+# via /api/print/progress. Batch jobs are sent chunk by chunk, so this is
+# what tells the user "18 of 30 labels sent" instead of a spinner that
+# looks dead for minutes.
+_PRINT_PROGRESS_LOCK = threading.Lock()
+_PRINT_PROGRESS = {
+    "active": False,
+    "total": 0,
+    "sent": 0,
+    "chunks_total": 0,
+    "chunks_done": 0,
+    "chunk_size": 0,
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+    "partial": False,
+}
+
+
+def _progress_reset(total, chunks_total, chunk_size):
+    with _PRINT_PROGRESS_LOCK:
+        _PRINT_PROGRESS.update({
+            "active": True,
+            "total": int(total),
+            "sent": 0,
+            "chunks_total": int(chunks_total),
+            "chunks_done": 0,
+            "chunk_size": int(chunk_size),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "error": None,
+            "partial": False,
+        })
+
+
+def _progress_update(**fields):
+    with _PRINT_PROGRESS_LOCK:
+        _PRINT_PROGRESS.update(fields)
+
+
+def print_progress_snapshot():
+    with _PRINT_PROGRESS_LOCK:
+        return dict(_PRINT_PROGRESS)
+
+
+class PartialPrintError(RuntimeError):
+    """Raised when only part of a job reached the printer.
+
+    `printed` is how many labels were confirmed sent before the failure;
+    the API returns it so the UI can say exactly how far the batch got
+    instead of a bare "print failed".
+    """
+
+    def __init__(self, message, printed=0, total=0, error=None):
+        super().__init__(message)
+        self.printed = int(printed or 0)
+        self.total = int(total or 0)
+        self.original_error = error
+
 
 LABEL_SPECS = {
     "12": (106, None),
@@ -2954,22 +3026,141 @@ def try_usb_reset(printer_uri=None):
         _PRINT_LOCK.release()
 
 
-def print_images(images, label_size):
+def print_images(images, label_size, chunk_size=None, on_chunk=None):
+    """
+    Send `images` to the printer, in chunks of `chunk_size` labels.
+
+    Why chunks: one giant transfer for a whole batch can overrun the
+    printer's input buffer or the host socket timeout. The symptom is
+    exactly "the first N labels print and then the job errors out".
+    Chunking keeps each transfer small, lets a retry re-send only the
+    labels that are still missing, and gives the UI real progress.
+
+    `on_chunk(printed_so_far, chunk_count)` is called after every chunk
+    the printer accepted, so callers can record per-label state (the
+    batch unique codes) even when a later chunk fails.
+
+    Raises PartialPrintError when some labels were sent before the
+    failure, with `.printed` / `.total` filled in.
+    """
+    images = list(images or [])
+
     if not images:
         raise ValueError(
             "There are no labels to print."
         )
 
+    total = len(images)
+
+    try:
+        chunk_size = int(chunk_size or BATCH_CHUNK_SIZE)
+    except (TypeError, ValueError):
+        chunk_size = BATCH_CHUNK_SIZE
+
+    chunk_size = max(1, chunk_size)
+
+    chunks = [
+        images[index:index + chunk_size]
+        for index in range(0, total, chunk_size)
+    ]
+
+    _progress_reset(total, len(chunks), chunk_size)
+
     # Never let two threads interleave USB traffic.
     acquired = _PRINT_LOCK.acquire(timeout=30)
     if not acquired:
+        _progress_update(
+            active=False,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            error="Another print job is already in progress.",
+        )
         raise RuntimeError(
             "Another print job is already in progress. "
             "Wait a few seconds and try again."
         )
+
+    sent = 0
+    last_result = {}
+
     try:
-        return _print_images_locked(images, label_size)
+        for index, chunk in enumerate(chunks, start=1):
+            logger.info(
+                "[print_images] chunk %d/%d (%d label(s), %d sent so far)",
+                index, len(chunks), len(chunk), sent,
+            )
+            try:
+                last_result = _print_images_locked(
+                    chunk,
+                    label_size
+                )
+            except Exception as e:
+                # Nothing printed yet: re-raise untouched so the caller
+                # reports the real cause (unreachable / no media / ...).
+                if sent == 0:
+                    _progress_update(
+                        active=False,
+                        error=str(e),
+                        finished_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                    raise
+
+                message = (
+                    f"Printed {sent} of {total} label(s) before the "
+                    f"printer stopped; the remaining {total - sent} "
+                    f"were not sent.\n\nLast error: {e}\n\n"
+                    "The label in the failed chunk may have printed "
+                    "partly -- check the printer output before "
+                    "reprinting, then print only the missing labels."
+                )
+                _progress_update(
+                    active=False,
+                    error=str(e),
+                    partial=True,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                )
+                raise PartialPrintError(
+                    message,
+                    printed=sent,
+                    total=total,
+                    error=e
+                ) from e
+
+            sent += len(chunk)
+
+            _progress_update(
+                sent=sent,
+                chunks_done=index
+            )
+
+            if on_chunk is not None:
+                try:
+                    on_chunk(sent, len(chunk))
+                except Exception as callback_error:
+                    # Bookkeeping must never turn a good print into a
+                    # failure the user sees.
+                    logger.warning(
+                        "[print_images] progress callback failed: %s",
+                        callback_error,
+                    )
+
+        _progress_update(
+            active=False,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+        result = dict(last_result or {})
+        result["printed"] = sent
+        result["chunks"] = len(chunks)
+        return result
+
     finally:
+        # If we left the loop through an unexpected path, make sure the
+        # progress endpoint never reports a job as still running.
+        if print_progress_snapshot().get("active"):
+            _progress_update(
+                active=False,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            )
         _clear_probe_cache()
         _PRINT_LOCK.release()
 
@@ -3026,7 +3217,10 @@ def _print_images_locked(images, label_size):
                     # timeouts, so they are unaffected; prints are
                     # serialised by _PRINT_LOCK.)
                     previous_timeout = socket.getdefaulttimeout()
-                    socket.setdefaulttimeout(15)
+                    # Bounds the whole raster write, not the connect.
+                    # Chunks keep this comfortably large timeout from
+                    # being hit by a normal batch.
+                    socket.setdefaulttimeout(NETWORK_PRINT_TIMEOUT)
                     try:
                         result = _send_once(qlr.data, uri)
                     finally:
@@ -3617,17 +3811,17 @@ def api_print():
             DEFAULT_LABEL_SIZE
         )
 
-        result = print_images(
-            images,
-            label_size
-        ) or {}
-
         batch_codes = meta.get("batch_codes") or []
+        printed_codes = 0
 
-        if batch_codes:
-            # Batch runs get their own unique codes -- record the print in
-            # the Summary history exactly like manually entered codes.
-            for item in batch_codes:
+        def mark_batch_chunk(printed_so_far, _chunk_len):
+            nonlocal printed_codes
+
+            # Batch labels are rendered in template order, so the codes
+            # line up 1:1 with the images that were just accepted.
+            end = min(int(printed_so_far), len(batch_codes))
+
+            for item in batch_codes[printed_codes:end]:
                 serial = item.get("serial")
 
                 if serial:
@@ -3637,7 +3831,20 @@ def api_print():
                         1
                     )
 
-        elif payload.get("kind") == "text":
+            printed_codes = end
+
+        result = print_images(
+            images,
+            label_size,
+            on_chunk=mark_batch_chunk if batch_codes else None,
+        ) or {}
+
+        if batch_codes and printed_codes < len(batch_codes):
+            # Should not happen after a clean send, but never lose a
+            # code's print record because of a rounding oddity.
+            mark_batch_chunk(len(batch_codes), 0)
+
+        if not batch_codes and payload.get("kind") == "text":
             copies = max(
                 1,
                 int(payload.get("copies", 1))
@@ -3659,14 +3866,15 @@ def api_print():
                             copies
                         )
 
-        elif payload.get("serial"):
+        elif not batch_codes and payload.get("serial"):
             mark_serial_printed(
                 payload["serial"]
             )
 
         response = {
             "ok": True,
-            "printed": len(images),
+            "printed": int(result.get("printed") or len(images)),
+            "chunks": int(result.get("chunks") or 1),
         }
         if batch_codes:
             response["batch_codes"] = batch_codes
@@ -3677,6 +3885,17 @@ def api_print():
                 response["warning"] = result["warning"]
         return jsonify(response)
 
+    except PartialPrintError as e:
+        traceback.print_exc()
+
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+            "printed": e.printed,
+            "total": e.total,
+            "partial": True,
+        }), 400
+
     except Exception as e:
         traceback.print_exc()
 
@@ -3684,6 +3903,14 @@ def api_print():
             "ok": False,
             "error": str(e)
         }), 400
+
+
+@app.route("/api/print/progress")
+def api_print_progress():
+    """Live progress of the job being sent (polled while printing)."""
+    resp = jsonify(print_progress_snapshot())
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 
 @app.route("/api/health")
